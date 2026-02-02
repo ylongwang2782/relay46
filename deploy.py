@@ -58,11 +58,16 @@ class NginxProxyDeployer:
         else:
             raise ValueError(f"Unknown target: {target}")
 
+        # 使用 ControlMaster 复用连接，避免频繁连接被限制
+        control_path = f"/tmp/ssh-relay46-{cfg['host']}"
         cmd = [
             "ssh",
             "-o", "StrictHostKeyChecking=no",
             "-o", "BatchMode=yes",
-            "-o", "ConnectTimeout=10",
+            "-o", "ConnectTimeout=30",
+            "-o", f"ControlPath={control_path}",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=300",
         ]
 
         if 'port' in cfg:
@@ -97,7 +102,13 @@ class NginxProxyDeployer:
         else:
             cfg = self.config.get('nas', {'host': self.config['backend']['host'], 'user': 'root'})
 
-        cmd = ["scp", "-o", "StrictHostKeyChecking=no", "-o", "BatchMode=yes"]
+        control_path = f"/tmp/ssh-relay46-{cfg['host']}"
+        cmd = [
+            "scp",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "BatchMode=yes",
+            "-o", f"ControlPath={control_path}",
+        ]
 
         if 'port' in cfg:
             cmd.extend(["-P", str(cfg['port'])])
