@@ -3,6 +3,16 @@
 # 复制此文件为 config.yaml 并填写配置
 # ===========================================
 
+# Cloudflare DNS 自动化配置 (可选)
+# 部署时自动更新 DNS 记录:
+#   - A 记录: 服务域名 -> VPS IPv4
+#   - AAAA 记录: 服务域名 -> NAS IPv6
+cloudflare:
+  enabled: false                          # 设为 true 启用 DNS 自动化
+  api_token: "YOUR_CLOUDFLARE_API_TOKEN"  # Zone:DNS:Edit 权限
+  zone_id: "YOUR_ZONE_ID"                 # 域名的 Zone ID (在 Cloudflare 面板查看)
+  proxied: false                          # true=橙色云(CDN代理), false=灰色云(仅DNS)
+
 # 远程服务器配置 (使用 SSH 密钥认证)
 # 部署前请先配置: ssh-copy-id user@host
 server:
@@ -17,6 +27,7 @@ nas:
   host: "nas.example.com"
   user: "your_nas_user"
   # identity_file: "~/.ssh/id_ed25519"
+  # ipv6: "2001:db8::1"              # 可选: 手动指定 NAS IPv6 (无法 SSH 获取时使用)
 
 # SSL 证书配置
 ssl:

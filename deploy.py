@@ -22,6 +22,9 @@ Nginx 反向代理一键部署脚本
 import subprocess
 import sys
 import os
+import json
+import urllib.request
+import urllib.error
 from pathlib import Path
 
 # 检查并安装 PyYAML
@@ -145,6 +148,210 @@ class NginxProxyDeployer:
             print(f"✗ 连接失败: {stderr}")
             print("  请确保已配置 SSH 密钥认证: ssh-copy-id user@host")
             return False
+
+    def get_vps_ipv4(self) -> str:
+        """获取 VPS 的 IPv4 地址"""
+        server_host = self.config['server']['host']
+
+        # Check if server.host is already an IP address
+        import re
+        ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
+        if re.match(ipv4_pattern, server_host):
+            return server_host
+
+        # Otherwise, get IP via SSH
+        code, stdout, stderr = self._ssh_cmd("curl -4 -s --connect-timeout 10 ifconfig.me")
+        if code == 0 and stdout.strip():
+            ip = stdout.strip()
+            if re.match(ipv4_pattern, ip):
+                return ip
+
+        raise RuntimeError(f"无法获取 VPS IPv4 地址: {stderr}")
+
+    def get_nas_ipv6(self) -> str:
+        """获取 NAS 的 IPv6 地址"""
+        # First check if ipv6 is specified in nas config
+        nas_config = self.config.get('nas', {})
+        if nas_config.get('ipv6'):
+            return nas_config['ipv6']
+
+        # Get NAS host for DNS resolution
+        nas_host = nas_config.get('host', self.config['backend']['host'])
+
+        # Try to resolve NAS IPv6 via VPS (since local may not have IPv6)
+        # Use dig to get AAAA record
+        code, stdout, stderr = self._ssh_cmd(f"dig +short AAAA {nas_host} | head -1")
+        if code == 0 and stdout.strip() and ':' in stdout.strip():
+            return stdout.strip()
+
+        # Fallback: try to get via SSH to NAS from local
+        code, stdout, stderr = self._ssh_cmd("curl -6 -s --connect-timeout 10 ifconfig.me", target="nas")
+        if code == 0 and stdout.strip():
+            ip = stdout.strip()
+            # Basic IPv6 validation
+            if ':' in ip:
+                return ip
+
+        raise RuntimeError(f"无法获取 NAS IPv6 地址: {stderr}\n  提示: 可在 config.yaml 的 nas.ipv6 字段手动指定 IPv6 地址")
+
+    def _cloudflare_api(self, method: str, endpoint: str, data: dict = None) -> dict:
+        """调用 Cloudflare API"""
+        cf_config = self.config.get('cloudflare', {})
+        api_token = cf_config.get('api_token', '')
+        base_url = "https://api.cloudflare.com/client/v4"
+
+        url = f"{base_url}{endpoint}"
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
+        }
+
+        request_data = json.dumps(data).encode('utf-8') if data else None
+        req = urllib.request.Request(url, data=request_data, headers=headers, method=method)
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                return json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8')
+            raise RuntimeError(f"Cloudflare API 错误 ({e.code}): {error_body}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Cloudflare API 网络错误: {e.reason}")
+
+    def _get_dns_record(self, zone_id: str, name: str, record_type: str) -> dict:
+        """查询 DNS 记录"""
+        endpoint = f"/zones/{zone_id}/dns_records?type={record_type}&name={name}"
+        result = self._cloudflare_api("GET", endpoint)
+
+        if result.get('success') and result.get('result'):
+            return result['result'][0]
+        return None
+
+    def _create_dns_record(self, zone_id: str, name: str, record_type: str, content: str, proxied: bool) -> bool:
+        """创建 DNS 记录"""
+        endpoint = f"/zones/{zone_id}/dns_records"
+        data = {
+            "type": record_type,
+            "name": name,
+            "content": content,
+            "proxied": proxied,
+            "ttl": 1  # Auto TTL when proxied, otherwise 1 = auto
+        }
+        result = self._cloudflare_api("POST", endpoint, data)
+        return result.get('success', False)
+
+    def _update_dns_record(self, zone_id: str, record_id: str, name: str, record_type: str, content: str, proxied: bool) -> bool:
+        """更新 DNS 记录"""
+        endpoint = f"/zones/{zone_id}/dns_records/{record_id}"
+        data = {
+            "type": record_type,
+            "name": name,
+            "content": content,
+            "proxied": proxied,
+            "ttl": 1
+        }
+        result = self._cloudflare_api("PUT", endpoint, data)
+        return result.get('success', False)
+
+    def update_cloudflare_dns(self) -> bool:
+        """更新 Cloudflare DNS 记录"""
+        cf_config = self.config.get('cloudflare', {})
+
+        if not cf_config.get('enabled', False):
+            print("⚠ Cloudflare DNS 未启用，跳过")
+            return True
+
+        if not cf_config.get('api_token') or not cf_config.get('zone_id'):
+            print("⚠ Cloudflare 配置不完整 (缺少 api_token 或 zone_id)，跳过")
+            return True
+
+        print("更新 Cloudflare DNS 记录...")
+
+        # Get IP addresses
+        try:
+            vps_ipv4 = self.get_vps_ipv4()
+            print(f"  VPS IPv4: {vps_ipv4}")
+        except RuntimeError as e:
+            print(f"✗ {e}")
+            return False
+
+        try:
+            nas_ipv6 = self.get_nas_ipv6()
+            print(f"  NAS IPv6: {nas_ipv6}")
+        except RuntimeError as e:
+            print(f"✗ {e}")
+            return False
+
+        zone_id = cf_config['zone_id']
+        proxied = cf_config.get('proxied', False)
+
+        services = self.config.get('services', [])
+        if not services:
+            print("⚠ 无 HTTP 服务配置，跳过 DNS 更新")
+            return True
+
+        success_count = 0
+        for service in services:
+            domain = service['domain']
+            print(f"\n  处理域名: {domain}")
+
+            # Update A record (VPS IPv4)
+            try:
+                existing_a = self._get_dns_record(zone_id, domain, "A")
+                if existing_a:
+                    if existing_a['content'] == vps_ipv4:
+                        print(f"    A 记录已是最新 ({vps_ipv4})")
+                    else:
+                        if self._update_dns_record(zone_id, existing_a['id'], domain, "A", vps_ipv4, proxied):
+                            print(f"    ✓ A 记录已更新: {existing_a['content']} -> {vps_ipv4}")
+                        else:
+                            print(f"    ✗ A 记录更新失败")
+                            continue
+                else:
+                    if self._create_dns_record(zone_id, domain, "A", vps_ipv4, proxied):
+                        print(f"    ✓ A 记录已创建: {vps_ipv4}")
+                    else:
+                        print(f"    ✗ A 记录创建失败")
+                        continue
+            except RuntimeError as e:
+                print(f"    ✗ A 记录操作失败: {e}")
+                continue
+
+            # Update AAAA record (NAS IPv6)
+            try:
+                existing_aaaa = self._get_dns_record(zone_id, domain, "AAAA")
+                if existing_aaaa:
+                    if existing_aaaa['content'] == nas_ipv6:
+                        print(f"    AAAA 记录已是最新 ({nas_ipv6})")
+                    else:
+                        if self._update_dns_record(zone_id, existing_aaaa['id'], domain, "AAAA", nas_ipv6, proxied):
+                            print(f"    ✓ AAAA 记录已更新: {existing_aaaa['content']} -> {nas_ipv6}")
+                        else:
+                            print(f"    ✗ AAAA 记录更新失败")
+                            continue
+                else:
+                    if self._create_dns_record(zone_id, domain, "AAAA", nas_ipv6, proxied):
+                        print(f"    ✓ AAAA 记录已创建: {nas_ipv6}")
+                    else:
+                        print(f"    ✗ AAAA 记录创建失败")
+                        continue
+            except RuntimeError as e:
+                print(f"    ✗ AAAA 记录操作失败: {e}")
+                continue
+
+            success_count += 1
+
+        if success_count == len(services):
+            print(f"\n✓ DNS 记录更新完成 ({success_count}/{len(services)} 域名)")
+            return True
+        elif success_count > 0:
+            print(f"\n⚠ DNS 记录部分更新 ({success_count}/{len(services)} 域名)")
+            response = input("是否继续部署? (y/N): ").strip().lower()
+            return response == 'y'
+        else:
+            print(f"\n✗ DNS 记录更新失败")
+            response = input("是否继续部署? (y/N): ").strip().lower()
+            return response == 'y'
 
     def install_packages(self) -> bool:
         """安装 Nginx 和 Certbot"""
@@ -593,8 +800,11 @@ echo "[$(date)] 同步完成!"
         """执行完整部署"""
         services = self.config.get('services', [])
         tcp_services = self.config.get('tcp_services', [])
+        cf_enabled = self.config.get('cloudflare', {}).get('enabled', False)
 
         total_steps = 4
+        if cf_enabled:
+            total_steps += 1  # DNS update step
         if services:
             total_steps += 4  # HTTP 配置、证书、最终配置、同步设置
         if tcp_services:
@@ -606,6 +816,8 @@ echo "[$(date)] 同步完成!"
         print(f"目标服务器: {self.config['server']['host']}")
         print(f"后端地址: {self.config['backend']['host']}")
         print(f"HTTP 服务: {len(services)}, TCP 服务: {len(tcp_services)}")
+        if cf_enabled:
+            print(f"Cloudflare DNS: 已启用")
 
         current_step = 0
 
@@ -613,6 +825,12 @@ echo "[$(date)] 同步完成!"
         self._print_step(current_step, total_steps, "测试 SSH 连接")
         if not self.test_connection():
             return False
+
+        if cf_enabled:
+            current_step += 1
+            self._print_step(current_step, total_steps, "更新 Cloudflare DNS")
+            if not self.update_cloudflare_dns():
+                return False
 
         current_step += 1
         self._print_step(current_step, total_steps, "安装软件包")
