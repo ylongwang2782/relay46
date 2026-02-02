@@ -1,0 +1,65 @@
+# ===========================================
+# Nginx 反向代理一键部署配置文件
+# 复制此文件为 config.yaml 并填写你的配置
+# ===========================================
+
+# 远程服务器配置
+server:
+  host: "YOUR_VPS_IP"
+  port: 22
+  user: "root"
+  password: "YOUR_PASSWORD"
+
+# SSL 证书配置
+ssl:
+  email: "your@email.com"
+
+# 后端 NAS 配置 (IPv6 DDNS 域名)
+backend:
+  host: "nas.example.com"
+
+# DNS 解析器配置
+resolver:
+  servers:
+    - "8.8.8.8"
+    - "8.8.4.4"
+  ipv6: true
+  valid: "300s"
+  timeout: "5s"
+
+# 代理服务列表
+services:
+  # 示例服务 1
+  - name: "web-panel"
+    domain: "panel.example.com"
+    backend_port: 5666
+    websocket: true           # 启用 WebSocket 支持
+    host_header: "frontend"   # 使用前端域名作为 Host 头
+    timeout:
+      connect: 60
+      send: 60
+      read: 60
+
+  # 示例服务 2
+  - name: "download"
+    domain: "dl.example.com"
+    backend_port: 9091
+    websocket: false
+    host_header: "backend"    # 使用后端地址作为 Host 头
+    timeout:
+      connect: 60
+      send: 120
+      read: 120
+
+# =========================================
+# 添加更多服务:
+# =========================================
+#  - name: "jellyfin"
+#    domain: "media.example.com"
+#    backend_port: 8096
+#    websocket: true
+#    host_header: "frontend"
+#    timeout:
+#      connect: 60
+#      send: 60
+#      read: 60
