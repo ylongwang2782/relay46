@@ -27,9 +27,9 @@ resolver:
   valid: "300s"
   timeout: "5s"
 
-# 代理服务列表
+# HTTP/HTTPS 代理服务列表
 services:
-  # 示例服务 1
+  # 示例服务 1: Web 管理面板
   - name: "web-panel"
     domain: "panel.example.com"
     backend_port: 5666
@@ -40,7 +40,7 @@ services:
       send: 60
       read: 60
 
-  # 示例服务 2
+  # 示例服务 2: 下载器
   - name: "download"
     domain: "dl.example.com"
     backend_port: 9091
@@ -52,7 +52,31 @@ services:
       read: 120
 
 # =========================================
-# 添加更多服务:
+# TCP/UDP 流代理 (SSH, 数据库等)
+# 使用 Nginx stream 模块
+# =========================================
+tcp_services:
+  # SSH 代理到 NAS
+  - name: "ssh"
+    listen_port: 2222        # VPS 监听端口 (避免与 VPS SSH 冲突)
+    backend_port: 22         # 后端 NAS 的 SSH 端口
+    protocol: "tcp"
+
+# =========================================
+# 添加更多 TCP 服务示例:
+# =========================================
+#  - name: "mysql"
+#    listen_port: 3307
+#    backend_port: 3306
+#    protocol: "tcp"
+#
+#  - name: "redis"
+#    listen_port: 6380
+#    backend_port: 6379
+#    protocol: "tcp"
+
+# =========================================
+# 添加更多 HTTP 服务示例:
 # =========================================
 #  - name: "jellyfin"
 #    domain: "media.example.com"
