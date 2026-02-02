@@ -1,14 +1,22 @@
 # ===========================================
 # Nginx 反向代理一键部署配置文件
-# 复制此文件为 config.yaml 并填写你的配置
+# 复制此文件为 config.yaml 并填写配置
 # ===========================================
 
-# 远程服务器配置
+# 远程服务器配置 (使用 SSH 密钥认证)
+# 部署前请先配置: ssh-copy-id user@host
 server:
   host: "YOUR_VPS_IP"
   port: 22
   user: "root"
-  password: "YOUR_PASSWORD"
+  # 可选: 指定 SSH 密钥路径，留空则使用默认密钥
+  # identity_file: "~/.ssh/id_ed25519"
+
+# NAS 配置 (用于证书同步，可选)
+nas:
+  host: "nas.example.com"
+  user: "your_nas_user"
+  # identity_file: "~/.ssh/id_ed25519"
 
 # SSL 证书配置
 ssl:
@@ -29,61 +37,37 @@ resolver:
 
 # HTTP/HTTPS 代理服务列表
 services:
-  # 示例服务 1: Web 管理面板
   - name: "web-panel"
     domain: "panel.example.com"
     backend_port: 5666
-    websocket: true           # 启用 WebSocket 支持
-    host_header: "frontend"   # 使用前端域名作为 Host 头
+    websocket: true
+    host_header: "frontend"
     timeout:
       connect: 60
       send: 60
       read: 60
 
-  # 示例服务 2: 下载器
   - name: "download"
     domain: "dl.example.com"
     backend_port: 9091
     websocket: false
-    host_header: "backend"    # 使用后端地址作为 Host 头
+    host_header: "backend"
     timeout:
       connect: 60
       send: 120
       read: 120
 
-# =========================================
-# TCP/UDP 流代理 (SSH, 数据库等)
-# 使用 Nginx stream 模块
-# =========================================
+# TCP 流代理 (SSH, 数据库等)
 tcp_services:
-  # SSH 代理到 NAS
   - name: "ssh"
-    listen_port: 2222        # VPS 监听端口 (避免与 VPS SSH 冲突)
-    backend_port: 22         # 后端 NAS 的 SSH 端口
+    listen_port: 2222
+    backend_port: 22
     protocol: "tcp"
 
 # =========================================
-# 添加更多 TCP 服务示例:
+# 添加更多服务示例:
 # =========================================
 #  - name: "mysql"
 #    listen_port: 3307
 #    backend_port: 3306
 #    protocol: "tcp"
-#
-#  - name: "redis"
-#    listen_port: 6380
-#    backend_port: 6379
-#    protocol: "tcp"
-
-# =========================================
-# 添加更多 HTTP 服务示例:
-# =========================================
-#  - name: "jellyfin"
-#    domain: "media.example.com"
-#    backend_port: 8096
-#    websocket: true
-#    host_header: "frontend"
-#    timeout:
-#      connect: 60
-#      send: 60
-#      read: 60
