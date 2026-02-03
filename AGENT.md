@@ -104,6 +104,13 @@ services:         # HTTP/HTTPS service list
     websocket: true
     host_header: "frontend"
 
+  - name: "istoreos"           # Service with local_backend (VM/other device)
+    domain: "istoreos.example.com"
+    backend_port: 8082         # VPS connects to NAS on this port
+    local_backend: "192.168.0.2:80"  # NAS proxies to this local address
+    websocket: true
+    host_header: "backend"
+
 tcp_services:     # TCP service list
   - name: "ssh"
     listen_port: 2222
@@ -120,14 +127,21 @@ tcp_services:     # TCP service list
 - `_generate_vps_http_proxy_conf()` - HTTP/HTTPS proxy rules
 - `_generate_vps_stream_conf()` - TCP stream proxy rules
 - `_generate_vps_sync_script()` - Certificate sync script
-- `_generate_nas_docker_compose()` - NAS docker-compose.yaml
-- `_generate_nas_nginx_conf()` - NAS nginx config
+- `_generate_nas_docker_compose()` - NAS docker-compose.yaml (auto-exposes ports for local_backend services)
+- `_generate_nas_nginx_conf()` - NAS nginx config (adds HTTP relay blocks for local_backend services)
 - `_generate_nas_ddns_script()` - DDNS update script
+
+**Certificate Management:**
+- `check_certs_exist()` - Check if certificates exist on VPS
+- `get_cert_domains()` - Get domains currently in the certificate
+- `request_certificates()` - Request/renew certificates with automatic AAAA record handling
+- `_temp_remove_aaaa_records()` - Temporarily remove AAAA records before cert request
+- `_restore_aaaa_records()` - Restore AAAA records after cert request
 
 **Deployment:**
 - `test_connection()` - Test SSH connection
 - `check_docker_installed()` - Check/install Docker
-- `deploy_vps()` - Deploy configuration to VPS
+- `deploy_vps()` - Deploy configuration to VPS (auto-detects new domains needing certs)
 - `deploy_nas()` - Deploy configuration to NAS
 - `setup_cron()` - Configure certificate renewal cron job
 - `verify_deployment()` - Verify containers are running
@@ -166,12 +180,25 @@ tcp_services:     # TCP service list
 
 ## Certificate Workflow
 
+### Automatic AAAA Record Handling
+
+When requesting certificates, the deployer automatically handles IPv6 (AAAA) records to prevent Let's Encrypt verification issues:
+
+1. Detects which domains need to be added to the certificate
+2. Temporarily removes AAAA records for those domains (prevents IPv6 verification which may fail if NAS doesn't handle ACME challenges)
+3. Requests the certificate via IPv4 through VPS
+4. Restores all AAAA records after certificate is obtained
+
+This is handled by the `request_certificates()` method which is called automatically during deployment when new domains are detected.
+
 ### First-Time Deployment
 1. Deploy nginx with HTTP-only config (for ACME challenge)
-2. Run certbot webroot challenge
-3. Update nginx config with SSL
-4. Reload nginx
-5. Manually sync certificates to NAS (VPS → local → NAS)
+2. Temporarily remove AAAA records for all domains
+3. Run certbot webroot challenge (via IPv4)
+4. Restore AAAA records
+5. Update nginx config with SSL
+6. Reload nginx
+7. Sync certificates to NAS (VPS → local → NAS)
 
 ### Renewal (Cron Job - twice daily)
 ```bash
