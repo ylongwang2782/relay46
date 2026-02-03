@@ -1,175 +1,237 @@
-# Relay46 项目说明
+# Relay46 Project Documentation
 
-## 项目概述
+## Overview
 
-Relay46 是一个 Nginx 反向代理一键部署工具，用于将 VPS（双栈）配置为家庭 NAS（仅 IPv6）的流量中转站。
+Relay46 is a Docker Compose based reverse proxy deployment tool that configures a VPS (dual-stack) as a traffic relay for a home NAS (IPv6 only).
 
-## 核心功能
+## Core Features
 
-1. **HTTP/HTTPS 反向代理** - 支持 WebSocket，自动申请 Let's Encrypt 证书
-2. **TCP 流代理** - 使用 Nginx stream 模块转发 SSH、数据库等 TCP 服务
-3. **证书自动同步** - VPS 证书续期后自动同步到 NAS
-4. **IPv4/IPv6 双栈支持** - IPv4 走 VPS 反代，IPv6 可直连 NAS
+1. **HTTP/HTTPS Reverse Proxy** - WebSocket support, automatic Let's Encrypt certificates
+2. **TCP Stream Proxy** - Forward SSH, databases, and other TCP services via Nginx stream
+3. **Certificate Auto-Sync** - VPS certificates synced to NAS after renewal
+4. **IPv4/IPv6 Dual-Stack** - IPv4 via VPS proxy, IPv6 direct to NAS
+5. **DDNS Updater** - Automatic Cloudflare AAAA record updates for dynamic IPv6
 
-## 架构
+## Architecture
 
 ```
-IPv4 用户 → fnos.ylongwang.top:443 → VPS Nginx → NAS:5666 (HTTP)
-IPv6 用户 → fnos.ylongwang.top:443 → NAS iptables → Docker Nginx:8443 → NAS:5666
-SSH 用户  → VPS:2222 → NAS:22
+IPv4 User → domain.com:443 → VPS Docker (nginx-proxy, host network) → NAS:port (via IPv6)
+IPv6 User → domain.com:443 → NAS iptables:8443 → NAS Docker (nginx-proxy) → NAS:port
+SSH User  → VPS:2222 → NAS:22 (via Nginx stream over IPv6)
 ```
 
-## 文件结构
+### VPS Deployment Structure
+
+```
+/opt/relay46/
+├── docker-compose.yaml      # VPS services (nginx-proxy with host network, certbot)
+├── nginx/
+│   ├── nginx.conf           # Main nginx config
+│   ├── conf.d/
+│   │   └── nas_proxy.conf   # HTTP/HTTPS reverse proxy rules
+│   └── stream.conf.d/
+│       └── tcp_proxy.conf   # TCP stream proxy rules
+├── certs/                   # Let's Encrypt certificates
+├── webroot/                 # ACME challenge files
+└── sync-cert-to-nas.sh      # Certificate sync script
+```
+
+### NAS Deployment Structure
+
+```
+~/relay46/
+├── docker-compose.yaml      # NAS services (nginx-proxy, ddns-updater)
+├── nginx/
+│   └── nginx.conf           # HTTPS termination config
+├── certs/
+│   ├── fullchain.crt        # Certificate (synced from VPS)
+│   └── private.key          # Private key (synced from VPS)
+├── ddns-script.sh           # Cloudflare DDNS update script
+├── .env                     # Cloudflare credentials
+└── logs/
+    └── ddns.log             # DDNS update logs
+```
+
+## File Structure
 
 ```
 relay46/
-├── deploy.py           # 主部署脚本 (Python)
-├── config.yaml         # 用户配置文件 (含敏感信息，不提交)
-├── config.example.yaml # 配置模板
-├── README.md           # 用户文档
-├── AGENT.md            # 项目说明 (本文件)
-└── .gitignore          # 忽略 config.yaml 等
+├── deploy.py                # Main deployment script (Python)
+├── config.yaml              # User configuration (contains secrets, not committed)
+├── config.example.yaml      # Configuration template
+├── templates/               # Template files (reference only, not used at runtime)
+│   ├── vps/                 # VPS templates
+│   └── nas/                 # NAS templates
+├── README.md                # User documentation
+├── AGENT.md                 # Project documentation (this file)
+└── .gitignore               # Excludes config.yaml etc.
 ```
 
-## 配置文件结构 (config.yaml)
+## Configuration (config.yaml)
 
 ```yaml
-server:           # VPS SSH 配置
+server:           # VPS SSH configuration
   host: "IP"
   port: 22
   user: "root"
-  # identity_file: "~/.ssh/id_ed25519"  # 可选
+  # identity_file: "~/.ssh/id_ed25519"
 
-nas:              # NAS SSH 配置 (用于证书同步)
-  host: "nas-origin.example.com"
+nas:              # NAS SSH configuration (accessed via VPS SSH tunnel)
+  host: "nas"     # SSH config alias that uses VPS:2222
   user: "username"
+  # deploy_path: "~/relay46"
 
-ssl:              # Let's Encrypt 配置
+ssl:              # Let's Encrypt configuration
   email: "admin@example.com"
 
-backend:          # 后端 NAS 地址 (IPv6 DDNS)
-  host: "nas-origin.example.com"
+backend:          # NAS backend address (IPv6 DDNS domain)
+  host: "nas.example.com"
 
-resolver:         # DNS 解析器
+cloudflare:       # Optional: Cloudflare DNS automation
+  enabled: true
+  api_token: "..."
+  zone_id: "..."
+  proxied: false
+
+resolver:         # DNS resolver for dynamic backend resolution
   servers: ["8.8.8.8", "8.8.4.4"]
   ipv6: true
 
-services:         # HTTP/HTTPS 服务列表
+services:         # HTTP/HTTPS service list
   - name: "fnos"
     domain: "fnos.example.com"
     backend_port: 5666
     websocket: true
-    host_header: "frontend"  # 或 "backend"
+    host_header: "frontend"
 
-tcp_services:     # TCP 服务列表
+tcp_services:     # TCP service list
   - name: "ssh"
     listen_port: 2222
     backend_port: 22
 ```
 
-## 部署脚本功能 (deploy.py)
+## Deployment Script (deploy.py)
 
-### 主要类: NginxProxyDeployer
+### Main Class: Relay46Deployer
 
-- `test_connection()` - 测试 SSH 连接
-- `install_packages()` - 安装 nginx, certbot, libnginx-mod-stream
-- `configure_firewall()` - 配置 UFW 防火墙
-- `deploy_nginx_config()` - 部署 HTTP 反向代理配置
-- `deploy_stream_config()` - 部署 TCP stream 配置
-- `request_certificates()` - 申请 Let's Encrypt 证书
-- `setup_cert_sync()` - 配置证书同步到 NAS
-- `verify_deployment()` - 验证部署结果
+**File Generation:**
+- `_generate_vps_docker_compose()` - VPS docker-compose.yaml (host network mode)
+- `_generate_vps_nginx_main_conf()` - VPS nginx main config
+- `_generate_vps_http_proxy_conf()` - HTTP/HTTPS proxy rules
+- `_generate_vps_stream_conf()` - TCP stream proxy rules
+- `_generate_vps_sync_script()` - Certificate sync script
+- `_generate_nas_docker_compose()` - NAS docker-compose.yaml
+- `_generate_nas_nginx_conf()` - NAS nginx config
+- `_generate_nas_ddns_script()` - DDNS update script
 
-### SSH 命令执行
+**Deployment:**
+- `test_connection()` - Test SSH connection
+- `check_docker_installed()` - Check/install Docker
+- `deploy_vps()` - Deploy configuration to VPS
+- `deploy_nas()` - Deploy configuration to NAS
+- `setup_cron()` - Configure certificate renewal cron job
+- `verify_deployment()` - Verify containers are running
 
-使用原生 SSH 密钥认证，无需 sshpass：
-```python
-def _ssh_cmd(self, command, target="server", timeout=120)
-def _scp_cmd(self, local_path, remote_path, target="server")
-```
+### Key Design Decisions
 
-## 远程服务器配置
+1. **VPS Host Network Mode**: nginx-proxy uses `network_mode: host` to access NAS via IPv6. Standard Docker bridge networking cannot route to external IPv6 addresses.
 
-### VPS 文件位置
+2. **Docker IPv6 Configuration**: VPS requires Docker IPv6 enabled in `/etc/docker/daemon.json`:
+   ```json
+   {
+     "ipv6": true,
+     "fixed-cidr-v6": "fd00::/80",
+     "ip6tables": true,
+     "experimental": true
+   }
+   ```
 
-- `/etc/nginx/conf.d/nas_proxy.conf` - HTTP 反向代理
-- `/etc/nginx/conf.d/websocket_map.conf` - WebSocket 映射
-- `/etc/nginx/stream.conf.d/tcp_proxy.conf` - TCP 流代理
-- `/etc/letsencrypt/` - SSL 证书
-- `/usr/local/bin/sync-cert-to-nas.sh` - 证书同步脚本
-- `/etc/letsencrypt/renewal-hooks/deploy/sync-to-nas.sh` - certbot hook
+3. **NAS Access via SSH Tunnel**: During deployment, NAS is accessed through VPS port 2222 (SSH tunnel). The tunnel must be operational before NAS deployment.
 
-### NAS 文件位置
+## Docker Services
 
-- `~/nginx-proxy/conf/nginx.conf` - Docker Nginx 配置
-- `~/nginx-proxy/certs/` - SSL 证书
-- `/etc/iptables/ip6tables.rules` - iptables 规则
-- `/etc/systemd/system/ip6tables-restore.service` - 规则恢复服务
+### VPS Services
 
-## NAS Docker Nginx
+| Service | Image | Network | Purpose |
+|---------|-------|---------|---------|
+| nginx-proxy | nginx:alpine | host | HTTP/HTTPS reverse proxy + TCP stream |
+| certbot | certbot/certbot | - | SSL certificate management (on-demand) |
 
-用于 IPv6 直连时提供 HTTPS：
+### NAS Services
 
+| Service | Image | Network | Purpose |
+|---------|-------|---------|---------|
+| nginx-proxy | nginx:alpine | bridge | HTTPS termination for IPv6 direct access |
+| ddns-updater | alpine:latest | host | Cloudflare AAAA record updater |
+
+## Certificate Workflow
+
+### First-Time Deployment
+1. Deploy nginx with HTTP-only config (for ACME challenge)
+2. Run certbot webroot challenge
+3. Update nginx config with SSL
+4. Reload nginx
+5. Manually sync certificates to NAS (VPS → local → NAS)
+
+### Renewal (Cron Job - twice daily)
 ```bash
-docker run -d \
-  --name nginx-proxy \
-  --restart unless-stopped \
-  --add-host host.docker.internal:host-gateway \
-  -p 8443:443 \
-  -v ~/nginx-proxy/conf/nginx.conf:/etc/nginx/nginx.conf:ro \
-  -v ~/nginx-proxy/certs:/etc/nginx/certs:ro \
-  nginx:alpine
+cd /opt/relay46 && \
+docker compose run --rm certbot renew --webroot -w /var/www/certbot && \
+docker compose exec nginx-proxy nginx -s reload && \
+/opt/relay46/sync-cert-to-nas.sh
 ```
 
-## IPv6 直连 443 端口实现
-
-使用 iptables 将特定 IPv6 地址的 443 流量重定向到 8443：
-
-```bash
-ip6tables -t nat -A PREROUTING -d 2409:8a55:321c:3501::905 -p tcp --dport 443 -j REDIRECT --to-port 8443
-```
-
-## 本地 SSH 配置
+## Local SSH Configuration
 
 ```
 # ~/.ssh/config
 
 Host vps relay46
-    HostName 108.61.219.138
+    HostName YOUR_VPS_IP
     User root
     IdentityFile ~/.ssh/id_ed25519
 
 Host nas fnos
-    HostName 108.61.219.138
+    HostName YOUR_VPS_IP
     Port 2222
-    User ylongwang
+    User your_user
     IdentityFile ~/.ssh/id_ed25519
 ```
 
-## 常用命令
+## Common Commands
 
 ```bash
-# 部署
+# Deploy
 python3 deploy.py
 
-# 连接
-ssh vps    # VPS
-ssh nas    # NAS (通过 VPS 2222 端口)
+# Connect
+ssh vps    # VPS direct
+ssh nas    # NAS via VPS port 2222
 
-# VPS 维护
-ssh vps "nginx -t && systemctl reload nginx"
-ssh vps "certbot renew"
-ssh vps "/usr/local/bin/sync-cert-to-nas.sh"
+# VPS Maintenance
+ssh vps "cd /opt/relay46 && docker compose ps"
+ssh vps "cd /opt/relay46 && docker compose logs -f nginx-proxy"
+ssh vps "cd /opt/relay46 && docker compose run --rm certbot renew"
 
-# NAS 维护
-ssh nas "docker logs nginx-proxy"
-ssh nas "docker exec nginx-proxy nginx -s reload"
+# NAS Maintenance
+ssh nas "cd ~/relay46 && docker compose ps"
+ssh nas "cd ~/relay46 && docker compose logs -f"
+ssh nas "cat ~/relay46/logs/ddns.log"
+
+# Manual cert sync (if needed)
+scp vps:/opt/relay46/certs/live/DOMAIN/fullchain.pem /tmp/
+scp vps:/opt/relay46/certs/live/DOMAIN/privkey.pem /tmp/
+scp /tmp/fullchain.pem nas:~/relay46/certs/fullchain.crt
+scp /tmp/privkey.pem nas:~/relay46/certs/private.key
+ssh nas "cd ~/relay46 && docker compose exec nginx-proxy nginx -s reload"
 ```
 
-## 注意事项
+## Notes
 
-1. 部署前需配置 SSH 密钥认证
-2. config.yaml 包含敏感信息，已在 .gitignore 中排除
-3. 域名 DNS 的 A 记录指向 VPS，AAAA 记录指向 NAS
-4. fnOS 自带 Nginx 占用 443 端口，需用 iptables 重定向
-5. 证书续期后会自动同步到 NAS 并重载 Docker Nginx
+1. Configure SSH key authentication before deployment
+2. config.yaml contains sensitive data and is excluded via .gitignore
+3. DNS A records point to VPS, AAAA records point to NAS
+4. NAS uses iptables to redirect :443 to :8443 for IPv6 direct access
+5. Certificates auto-sync to NAS after VPS renewal (requires VPS→NAS SSH access)
+6. DDNS updater runs every 5 minutes to update AAAA records
+7. First deployment may require manual certificate sync due to SSH tunnel bootstrap

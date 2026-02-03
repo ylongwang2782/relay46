@@ -22,12 +22,13 @@ server:
   # 可选: 指定 SSH 密钥路径，留空则使用默认密钥
   # identity_file: "~/.ssh/id_ed25519"
 
-# NAS 配置 (用于证书同步，可选)
+# NAS 配置 (用于证书同步和 Docker 部署，可选)
 nas:
   host: "nas.example.com"
   user: "your_nas_user"
   # identity_file: "~/.ssh/id_ed25519"
   # ipv6: "2001:db8::1"              # 可选: 手动指定 NAS IPv6 (无法 SSH 获取时使用)
+  # deploy_path: "~/relay46"          # 可选: NAS 上的部署目录 (默认 ~/relay46)
 
 # SSL 证书配置
 ssl:

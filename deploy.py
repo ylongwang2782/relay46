@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 """
-Nginx 反向代理一键部署脚本
-用于将 VPS 配置为 IPv6 NAS 的反向代理
+Relay46 - Docker Compose based reverse proxy deployment
 
-支持:
-    - HTTP/HTTPS 反向代理 (WebSocket)
-    - TCP 流代理 (SSH, 数据库等)
-    - SSL 证书自动同步到 NAS
+Deploys nginx reverse proxy to VPS and NAS using Docker Compose:
+    - VPS: HTTP/HTTPS reverse proxy + TCP stream + SSL certificates
+    - NAS: HTTPS termination for IPv6 direct access + DDNS updater
 
-使用方法:
-    1. 配置 SSH 密钥认证 (ssh-copy-id)
-    2. 编辑 config.yaml 配置文件
-    3. 运行: python3 deploy.py
+Usage:
+    1. Configure SSH key authentication (ssh-copy-id)
+    2. Edit config.yaml
+    3. Run: python3 deploy.py
 
-依赖:
+Requirements:
     - Python 3.6+
     - PyYAML: pip3 install pyyaml
-    - SSH 密钥认证 (无需 sshpass)
+    - SSH key authentication
 """
 
 import subprocess
@@ -25,33 +23,42 @@ import os
 import json
 import urllib.request
 import urllib.error
+import tempfile
+import shutil
 from pathlib import Path
+from typing import Dict, List, Tuple, Optional
 
-# 检查并安装 PyYAML
+# Install PyYAML if not available
 try:
     import yaml
 except ImportError:
-    print("正在安装 PyYAML...")
+    print("Installing PyYAML...")
     subprocess.check_call([sys.executable, "-m", "pip", "install", "pyyaml", "-q"])
     import yaml
 
 
-class NginxProxyDeployer:
+class Relay46Deployer:
+    """Docker Compose based deployment for relay46"""
+
+    VPS_DEPLOY_PATH = "/opt/relay46"
+    NAS_DEPLOY_PATH_DEFAULT = "~/relay46"
+
     def __init__(self, config_path: str = "config.yaml"):
         self.config_path = Path(config_path)
         self.config = self._load_config()
+        self.script_dir = Path(__file__).parent.resolve()
 
     def _load_config(self) -> dict:
-        """加载 YAML 配置文件"""
+        """Load YAML configuration file"""
         if not self.config_path.exists():
-            print(f"错误: 配置文件 {self.config_path} 不存在")
+            print(f"Error: Config file {self.config_path} not found")
             sys.exit(1)
 
         with open(self.config_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)
 
-    def _build_ssh_cmd(self, target: str = "server") -> list:
-        """构建 SSH 命令基础参数"""
+    def _build_ssh_cmd(self, target: str = "server") -> List[str]:
+        """Build SSH command with connection pooling"""
         if target == "server":
             cfg = self.config['server']
         elif target == "nas":
@@ -61,7 +68,6 @@ class NginxProxyDeployer:
         else:
             raise ValueError(f"Unknown target: {target}")
 
-        # 使用 ControlMaster 复用连接，避免频繁连接被限制
         control_path = f"/tmp/ssh-relay46-{cfg['host']}"
         cmd = [
             "ssh",
@@ -83,8 +89,8 @@ class NginxProxyDeployer:
         cmd.append(f"{cfg['user']}@{cfg['host']}")
         return cmd
 
-    def _ssh_cmd(self, command: str, target: str = "server", timeout: int = 120) -> tuple[int, str, str]:
-        """执行远程 SSH 命令"""
+    def _ssh_cmd(self, command: str, target: str = "server", timeout: int = 120) -> Tuple[int, str, str]:
+        """Execute remote SSH command"""
         ssh_command = self._build_ssh_cmd(target) + [command]
 
         try:
@@ -96,10 +102,10 @@ class NginxProxyDeployer:
             )
             return result.returncode, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
-            return -1, "", "命令执行超时"
+            return -1, "", "Command timeout"
 
-    def _scp_cmd(self, local_path: str, remote_path: str, target: str = "server") -> tuple[int, str, str]:
-        """SCP 文件到远程"""
+    def _scp_file(self, local_path: str, remote_path: str, target: str = "server") -> Tuple[int, str, str]:
+        """SCP file to remote host"""
         if target == "server":
             cfg = self.config['server']
         else:
@@ -126,306 +132,188 @@ class NginxProxyDeployer:
             result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
             return result.returncode, result.stdout, result.stderr
         except subprocess.TimeoutExpired:
-            return -1, "", "SCP 超时"
+            return -1, "", "SCP timeout"
+
+    def _scp_dir(self, local_path: str, remote_path: str, target: str = "server") -> Tuple[int, str, str]:
+        """SCP directory recursively to remote host"""
+        if target == "server":
+            cfg = self.config['server']
+        else:
+            cfg = self.config.get('nas', {'host': self.config['backend']['host'], 'user': 'root'})
+
+        control_path = f"/tmp/ssh-relay46-{cfg['host']}"
+        cmd = [
+            "scp", "-r",
+            "-o", "StrictHostKeyChecking=no",
+            "-o", "BatchMode=yes",
+            "-o", f"ControlPath={control_path}",
+        ]
+
+        if 'port' in cfg:
+            cmd.extend(["-P", str(cfg['port'])])
+
+        if 'identity_file' in cfg:
+            identity = os.path.expanduser(cfg['identity_file'])
+            cmd.extend(["-i", identity])
+
+        cmd.extend([local_path, f"{cfg['user']}@{cfg['host']}:{remote_path}"])
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+            return result.returncode, result.stdout, result.stderr
+        except subprocess.TimeoutExpired:
+            return -1, "", "SCP timeout"
 
     def _print_step(self, step: int, total: int, message: str):
-        """打印步骤信息"""
+        """Print step information"""
         print(f"\n[{step}/{total}] {message}")
         print("=" * 50)
 
-    def test_connection(self) -> bool:
-        """测试 SSH 连接"""
-        print(f"测试连接到 {self.config['server']['host']}...")
-        code, stdout, stderr = self._ssh_cmd("echo 'Connection OK' && cat /etc/os-release | grep PRETTY_NAME")
+    # =========================================================================
+    # VPS File Generation
+    # =========================================================================
 
-        if code == 0:
-            print(f"✓ 连接成功")
-            for line in stdout.strip().split('\n'):
-                if 'PRETTY_NAME' in line or 'Connection' in line:
-                    print(f"  {line}")
-            return True
-        else:
-            print(f"✗ 连接失败: {stderr}")
-            print("  请确保已配置 SSH 密钥认证: ssh-copy-id user@host")
-            return False
+    def _generate_vps_docker_compose(self) -> str:
+        """Generate VPS docker-compose.yaml"""
+        # Use host network mode for IPv6 connectivity to NAS
+        template = '''# VPS Docker Compose Configuration
+# Auto-generated by relay46 deployer
 
-    def get_vps_ipv4(self) -> str:
-        """获取 VPS 的 IPv4 地址"""
-        server_host = self.config['server']['host']
+services:
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./nginx/conf.d:/etc/nginx/conf.d:ro
+      - ./nginx/stream.conf.d:/etc/nginx/stream.conf.d:ro
+      - ./certs:/etc/letsencrypt:ro
+      - ./webroot:/var/www/certbot:ro
 
-        # Check if server.host is already an IP address
-        import re
-        ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
-        if re.match(ipv4_pattern, server_host):
-            return server_host
+  certbot:
+    image: certbot/certbot
+    container_name: certbot
+    volumes:
+      - ./certs:/etc/letsencrypt
+      - ./webroot:/var/www/certbot
+    profiles:
+      - certbot
+'''
+        return template
 
-        # Otherwise, get IP via SSH
-        code, stdout, stderr = self._ssh_cmd("curl -4 -s --connect-timeout 10 ifconfig.me")
-        if code == 0 and stdout.strip():
-            ip = stdout.strip()
-            if re.match(ipv4_pattern, ip):
-                return ip
+    def _generate_vps_nginx_main_conf(self) -> str:
+        """Generate VPS nginx main config"""
+        return '''# Main Nginx configuration for VPS
+# Auto-generated by relay46 deployer
 
-        raise RuntimeError(f"无法获取 VPS IPv4 地址: {stderr}")
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log notice;
+pid /var/run/nginx.pid;
 
-    def get_nas_ipv6(self) -> str:
-        """获取 NAS 的 IPv6 地址"""
-        # First check if ipv6 is specified in nas config
-        nas_config = self.config.get('nas', {})
-        if nas_config.get('ipv6'):
-            return nas_config['ipv6']
+events {
+    worker_connections 1024;
+}
 
-        # Get NAS host for DNS resolution
-        nas_host = nas_config.get('host', self.config['backend']['host'])
+http {
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
 
-        # Try to resolve NAS IPv6 via VPS (since local may not have IPv6)
-        # Use dig to get AAAA record
-        code, stdout, stderr = self._ssh_cmd(f"dig +short AAAA {nas_host} | head -1")
-        if code == 0 and stdout.strip() and ':' in stdout.strip():
-            return stdout.strip()
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
 
-        # Fallback: try to get via SSH to NAS from local
-        code, stdout, stderr = self._ssh_cmd("curl -6 -s --connect-timeout 10 ifconfig.me", target="nas")
-        if code == 0 and stdout.strip():
-            ip = stdout.strip()
-            # Basic IPv6 validation
-            if ':' in ip:
-                return ip
+    access_log /var/log/nginx/access.log main;
 
-        raise RuntimeError(f"无法获取 NAS IPv6 地址: {stderr}\n  提示: 可在 config.yaml 的 nas.ipv6 字段手动指定 IPv6 地址")
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+    types_hash_max_size 2048;
 
-    def _cloudflare_api(self, method: str, endpoint: str, data: dict = None) -> dict:
-        """调用 Cloudflare API"""
-        cf_config = self.config.get('cloudflare', {})
-        api_token = cf_config.get('api_token', '')
-        base_url = "https://api.cloudflare.com/client/v4"
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
 
-        url = f"{base_url}{endpoint}"
-        headers = {
-            "Authorization": f"Bearer {api_token}",
-            "Content-Type": "application/json"
-        }
+    include /etc/nginx/conf.d/*.conf;
+}
 
-        request_data = json.dumps(data).encode('utf-8') if data else None
-        req = urllib.request.Request(url, data=request_data, headers=headers, method=method)
+stream {
+    include /etc/nginx/stream.conf.d/*.conf;
+}
+'''
 
-        try:
-            with urllib.request.urlopen(req, timeout=30) as response:
-                return json.loads(response.read().decode('utf-8'))
-        except urllib.error.HTTPError as e:
-            error_body = e.read().decode('utf-8')
-            raise RuntimeError(f"Cloudflare API 错误 ({e.code}): {error_body}")
-        except urllib.error.URLError as e:
-            raise RuntimeError(f"Cloudflare API 网络错误: {e.reason}")
-
-    def _get_dns_record(self, zone_id: str, name: str, record_type: str) -> dict:
-        """查询 DNS 记录"""
-        endpoint = f"/zones/{zone_id}/dns_records?type={record_type}&name={name}"
-        result = self._cloudflare_api("GET", endpoint)
-
-        if result.get('success') and result.get('result'):
-            return result['result'][0]
-        return None
-
-    def _create_dns_record(self, zone_id: str, name: str, record_type: str, content: str, proxied: bool) -> bool:
-        """创建 DNS 记录"""
-        endpoint = f"/zones/{zone_id}/dns_records"
-        data = {
-            "type": record_type,
-            "name": name,
-            "content": content,
-            "proxied": proxied,
-            "ttl": 1  # Auto TTL when proxied, otherwise 1 = auto
-        }
-        result = self._cloudflare_api("POST", endpoint, data)
-        return result.get('success', False)
-
-    def _update_dns_record(self, zone_id: str, record_id: str, name: str, record_type: str, content: str, proxied: bool) -> bool:
-        """更新 DNS 记录"""
-        endpoint = f"/zones/{zone_id}/dns_records/{record_id}"
-        data = {
-            "type": record_type,
-            "name": name,
-            "content": content,
-            "proxied": proxied,
-            "ttl": 1
-        }
-        result = self._cloudflare_api("PUT", endpoint, data)
-        return result.get('success', False)
-
-    def update_cloudflare_dns(self) -> bool:
-        """更新 Cloudflare DNS 记录"""
-        cf_config = self.config.get('cloudflare', {})
-
-        if not cf_config.get('enabled', False):
-            print("⚠ Cloudflare DNS 未启用，跳过")
-            return True
-
-        if not cf_config.get('api_token') or not cf_config.get('zone_id'):
-            print("⚠ Cloudflare 配置不完整 (缺少 api_token 或 zone_id)，跳过")
-            return True
-
-        print("更新 Cloudflare DNS 记录...")
-
-        # Get IP addresses
-        try:
-            vps_ipv4 = self.get_vps_ipv4()
-            print(f"  VPS IPv4: {vps_ipv4}")
-        except RuntimeError as e:
-            print(f"✗ {e}")
-            return False
-
-        try:
-            nas_ipv6 = self.get_nas_ipv6()
-            print(f"  NAS IPv6: {nas_ipv6}")
-        except RuntimeError as e:
-            print(f"✗ {e}")
-            return False
-
-        zone_id = cf_config['zone_id']
-        proxied = cf_config.get('proxied', False)
-
-        services = self.config.get('services', [])
-        if not services:
-            print("⚠ 无 HTTP 服务配置，跳过 DNS 更新")
-            return True
-
-        success_count = 0
-        for service in services:
-            domain = service['domain']
-            print(f"\n  处理域名: {domain}")
-
-            # Update A record (VPS IPv4)
-            try:
-                existing_a = self._get_dns_record(zone_id, domain, "A")
-                if existing_a:
-                    if existing_a['content'] == vps_ipv4:
-                        print(f"    A 记录已是最新 ({vps_ipv4})")
-                    else:
-                        if self._update_dns_record(zone_id, existing_a['id'], domain, "A", vps_ipv4, proxied):
-                            print(f"    ✓ A 记录已更新: {existing_a['content']} -> {vps_ipv4}")
-                        else:
-                            print(f"    ✗ A 记录更新失败")
-                            continue
-                else:
-                    if self._create_dns_record(zone_id, domain, "A", vps_ipv4, proxied):
-                        print(f"    ✓ A 记录已创建: {vps_ipv4}")
-                    else:
-                        print(f"    ✗ A 记录创建失败")
-                        continue
-            except RuntimeError as e:
-                print(f"    ✗ A 记录操作失败: {e}")
-                continue
-
-            # Update AAAA record (NAS IPv6)
-            try:
-                existing_aaaa = self._get_dns_record(zone_id, domain, "AAAA")
-                if existing_aaaa:
-                    if existing_aaaa['content'] == nas_ipv6:
-                        print(f"    AAAA 记录已是最新 ({nas_ipv6})")
-                    else:
-                        if self._update_dns_record(zone_id, existing_aaaa['id'], domain, "AAAA", nas_ipv6, proxied):
-                            print(f"    ✓ AAAA 记录已更新: {existing_aaaa['content']} -> {nas_ipv6}")
-                        else:
-                            print(f"    ✗ AAAA 记录更新失败")
-                            continue
-                else:
-                    if self._create_dns_record(zone_id, domain, "AAAA", nas_ipv6, proxied):
-                        print(f"    ✓ AAAA 记录已创建: {nas_ipv6}")
-                    else:
-                        print(f"    ✗ AAAA 记录创建失败")
-                        continue
-            except RuntimeError as e:
-                print(f"    ✗ AAAA 记录操作失败: {e}")
-                continue
-
-            success_count += 1
-
-        if success_count == len(services):
-            print(f"\n✓ DNS 记录更新完成 ({success_count}/{len(services)} 域名)")
-            return True
-        elif success_count > 0:
-            print(f"\n⚠ DNS 记录部分更新 ({success_count}/{len(services)} 域名)")
-            response = input("是否继续部署? (y/N): ").strip().lower()
-            return response == 'y'
-        else:
-            print(f"\n✗ DNS 记录更新失败")
-            response = input("是否继续部署? (y/N): ").strip().lower()
-            return response == 'y'
-
-    def install_packages(self) -> bool:
-        """安装 Nginx 和 Certbot"""
-        print("安装 Nginx 和 Certbot...")
-
-        commands = [
-            "export DEBIAN_FRONTEND=noninteractive",
-            "apt-get update -qq",
-            "apt-get install -y -qq nginx certbot python3-certbot-nginx libnginx-mod-stream"
-        ]
-
-        code, stdout, stderr = self._ssh_cmd(" && ".join(commands), timeout=180)
-
-        if code == 0:
-            print("✓ 软件包安装完成")
-            return True
-        else:
-            print(f"✗ 安装失败: {stderr}")
-            return False
-
-    def configure_firewall(self) -> bool:
-        """配置防火墙"""
-        print("配置防火墙...")
-
-        commands = [
-            "ufw allow 80/tcp",
-            "ufw allow 443/tcp",
-        ]
-
-        tcp_services = self.config.get('tcp_services', [])
-        for svc in tcp_services:
-            port = svc['listen_port']
-            commands.append(f"ufw allow {port}/tcp")
-
-        commands.extend([
-            "ufw --force enable",
-            "ufw reload"
-        ])
-
-        code, stdout, stderr = self._ssh_cmd(" && ".join(commands))
-
-        if code == 0:
-            ports = "80/443"
-            if tcp_services:
-                ports += "/" + "/".join(str(s['listen_port']) for s in tcp_services)
-            print(f"✓ 防火墙配置完成 (已开放 {ports} 端口)")
-            return True
-        else:
-            print("⚠ 防火墙配置跳过 (可能未安装 UFW)")
-            return True
-
-    def _generate_nginx_config(self) -> str:
-        """生成 Nginx 配置文件内容"""
+    def _generate_vps_http_proxy_conf(self, with_ssl: bool = True) -> str:
+        """Generate VPS HTTP proxy configuration"""
         config = self.config
         resolver = config['resolver']
         backend = config['backend']
         services = config.get('services', [])
 
         if not services:
-            return "# 无 HTTP 服务配置\n"
+            return "# No HTTP services configured\n"
 
         resolver_servers = " ".join(resolver['servers'])
         resolver_ipv6 = "ipv6=on" if resolver.get('ipv6', True) else "ipv6=off"
 
         nginx_config = f'''# ===========================================
-# NAS 反向代理配置 (自动生成)
-# 后端: {backend['host']}
+# NAS HTTP/HTTPS Reverse Proxy Configuration
+# Auto-generated by relay46 deployer
+# Backend: {backend['host']}
 # ===========================================
 
 resolver {resolver_servers} {resolver_ipv6} valid={resolver.get('valid', '300s')};
 resolver_timeout {resolver.get('timeout', '5s')};
 
+# WebSocket connection upgrade mapping
+map $http_upgrade $connection_upgrade {{
+    default upgrade;
+    ''      close;
+}}
+
+# ACME challenge server
+server {{
+    listen 80 default_server;
+    listen [::]:80 default_server;
+    server_name _;
+
+    location /.well-known/acme-challenge/ {{
+        root /var/www/certbot;
+    }}
+
+    location / {{
+        return 301 https://$host$request_uri;
+    }}
+}}
+
 '''
 
+        if not with_ssl:
+            # Generate temporary config for initial certificate request
+            for service in services:
+                domain = service['domain']
+                nginx_config += f'''server {{
+    listen 80;
+    listen [::]:80;
+    server_name {domain};
+
+    location /.well-known/acme-challenge/ {{
+        root /var/www/certbot;
+    }}
+
+    location / {{
+        return 200 "OK";
+    }}
+}}
+
+'''
+            return nginx_config
+
+        # Generate full SSL config
         first_ssl_domain = services[0]['domain'] if services else None
 
         for i, service in enumerate(services):
@@ -437,31 +325,22 @@ resolver_timeout {resolver.get('timeout', '5s')};
             timeout = service.get('timeout', {'connect': 60, 'send': 60, 'read': 60})
 
             ssl_domain = first_ssl_domain
-            ipv6_ssl_listen = "listen [::]:443 ssl http2 ipv6only=on;" if i == 0 else "listen [::]:443 ssl http2;"
 
             nginx_config += f'''# =====================
 # {name.upper()}
 # =====================
 server {{
-    listen 80;
-    listen [::]:80;
-    server_name {domain};
-
-    if ($host = {domain}) {{
-        return 301 https://$host$request_uri;
-    }}
-    return 404;
-}}
-
-server {{
     listen 443 ssl http2;
-    {ipv6_ssl_listen}
+    listen [::]:443 ssl http2;
     server_name {domain};
 
     ssl_certificate /etc/letsencrypt/live/{ssl_domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/{ssl_domain}/privkey.pem;
-    include /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
 
     set $backend_host "{backend['host']}";
     set $backend_port {port};
@@ -470,7 +349,6 @@ server {{
         proxy_pass http://$backend_host:$backend_port;
 
 '''
-
             if host_header == 'backend':
                 nginx_config += '        proxy_set_header Host $backend_host:$backend_port;\n'
             else:
@@ -482,7 +360,6 @@ server {{
 
         proxy_http_version 1.1;
 '''
-
             if websocket:
                 nginx_config += '''        proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection $connection_upgrade;
@@ -504,27 +381,19 @@ server {{
 
         return nginx_config
 
-    def _generate_websocket_map(self) -> str:
-        """生成 WebSocket 映射配置"""
-        return '''# WebSocket 连接升级映射
-map $http_upgrade $connection_upgrade {
-    default upgrade;
-    ''      close;
-}
-'''
-
-    def _generate_stream_config(self) -> str:
-        """生成 TCP stream 配置"""
+    def _generate_vps_stream_conf(self) -> str:
+        """Generate VPS TCP stream configuration"""
         tcp_services = self.config.get('tcp_services', [])
         if not tcp_services:
-            return ""
+            return "# No TCP services configured\n"
 
         backend = self.config['backend']['host']
         resolver = self.config['resolver']
         resolver_servers = " ".join(resolver['servers'])
         resolver_ipv6 = "ipv6=on" if resolver.get('ipv6', True) else "ipv6=off"
 
-        stream_config = f'''# TCP 流代理配置 (自动生成)
+        stream_config = f'''# TCP Stream Proxy Configuration
+# Auto-generated by relay46 deployer
 
 resolver {resolver_servers} {resolver_ipv6} valid={resolver.get('valid', '300s')};
 resolver_timeout {resolver.get('timeout', '5s')};
@@ -549,202 +418,260 @@ server {{
 
         return stream_config
 
-    def deploy_nginx_config(self) -> bool:
-        """部署 Nginx 配置文件"""
-        print("生成并部署 Nginx 配置...")
-
-        nginx_config = self._generate_nginx_config()
-        websocket_map = self._generate_websocket_map()
-
+    def _generate_vps_sync_script(self) -> str:
+        """Generate certificate sync script for VPS"""
+        nas_config = self.config.get('nas', {})
         services = self.config.get('services', [])
-        if services:
-            temp_config = ""
-            for service in services:
-                domain = service['domain']
-                temp_config += f'''server {{
-    listen 80;
-    listen [::]:80;
-    server_name {domain};
-    location / {{ return 200 "OK"; }}
+
+        if not services or not nas_config:
+            return "#!/bin/bash\necho 'No NAS configured for cert sync'\n"
+
+        domain = services[0]['domain']
+        nas_host = nas_config.get('host', self.config['backend']['host'])
+        nas_user = nas_config.get('user', 'root')
+        nas_port = nas_config.get('port', '')
+        nas_identity = nas_config.get('identity_file', '')
+        nas_deploy_path = nas_config.get('deploy_path', self.NAS_DEPLOY_PATH_DEFAULT)
+
+        # Build SSH options
+        ssh_opts = "-o StrictHostKeyChecking=no -o BatchMode=yes"
+        scp_opts = ""
+        if nas_identity:
+            ssh_opts += f' -i {nas_identity}'
+        if nas_port:
+            ssh_opts += f' -p {nas_port}'
+            scp_opts = f'-P {nas_port}'
+
+        return f'''#!/bin/bash
+# SSL Certificate Sync Script - Sync to NAS Docker Nginx
+# Auto-generated by relay46 deployer
+
+set -e
+
+DOMAIN="{domain}"
+NAS_HOST="{nas_host}"
+NAS_USER="{nas_user}"
+CERT_DIR="/opt/relay46/certs/live/${{DOMAIN}}"
+NAS_CERT_DIR="{nas_deploy_path}/certs"
+SSH_OPTS="{ssh_opts}"
+SCP_OPTS="{scp_opts}"
+
+log() {{
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1"
+}}
+
+if [ ! -f "${{CERT_DIR}}/fullchain.pem" ]; then
+    log "ERROR: Certificate not found at ${{CERT_DIR}}"
+    exit 1
+fi
+
+log "Syncing certificates to NAS..."
+
+# Create remote directory if not exists
+ssh $SSH_OPTS ${{NAS_USER}}@${{NAS_HOST}} "mkdir -p ${{NAS_CERT_DIR}}"
+
+# Sync certificates
+scp $SSH_OPTS $SCP_OPTS "${{CERT_DIR}}/fullchain.pem" "${{NAS_USER}}@${{NAS_HOST}}:${{NAS_CERT_DIR}}/fullchain.crt"
+scp $SSH_OPTS $SCP_OPTS "${{CERT_DIR}}/privkey.pem" "${{NAS_USER}}@${{NAS_HOST}}:${{NAS_CERT_DIR}}/private.key"
+
+# Reload NAS nginx
+ssh $SSH_OPTS ${{NAS_USER}}@${{NAS_HOST}} "cd {nas_deploy_path} && docker compose exec -T nginx-proxy nginx -s reload 2>/dev/null || true"
+
+log "Certificate sync completed!"
+'''
+
+    def _generate_vps_cron(self) -> str:
+        """Generate cron job for certificate renewal"""
+        return '''# Certbot renewal - runs twice daily
+0 0,12 * * * cd /opt/relay46 && docker compose run --rm certbot renew --webroot -w /var/www/certbot && docker compose exec nginx-proxy nginx -s reload && /opt/relay46/sync-cert-to-nas.sh >> /var/log/cert-renewal.log 2>&1
+'''
+
+    # =========================================================================
+    # NAS File Generation
+    # =========================================================================
+
+    def _generate_nas_docker_compose(self) -> str:
+        """Generate NAS docker-compose.yaml"""
+        cf_config = self.config.get('cloudflare', {})
+        cf_enabled = cf_config.get('enabled', False)
+
+        compose = '''# NAS Docker Compose Configuration
+# Auto-generated by relay46 deployer
+
+services:
+  nginx-proxy:
+    image: nginx:alpine
+    container_name: nginx-proxy
+    restart: unless-stopped
+    ports:
+      - "8443:443"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+    networks:
+      - proxy-net
+
+'''
+        if cf_enabled:
+            compose += '''  ddns-updater:
+    image: alpine:latest
+    container_name: ddns-updater
+    restart: unless-stopped
+    network_mode: host
+    env_file:
+      - .env
+    volumes:
+      - ./ddns-script.sh:/ddns-script.sh:ro
+      - ./logs:/var/log/ddns
+    entrypoint: ["/bin/sh", "-c", "apk add --no-cache curl && while true; do /ddns-script.sh; sleep 300; done"]
+
+'''
+
+        compose += '''networks:
+  proxy-net:
+    driver: bridge
+'''
+        return compose
+
+    def _generate_nas_nginx_conf(self) -> str:
+        """Generate NAS nginx configuration"""
+        services = self.config.get('services', [])
+        backend = self.config['backend']
+
+        if not services:
+            return "# No services configured\n"
+
+        server_names = " ".join([s['domain'] for s in services])
+
+        # Generate location blocks for each service
+        location_blocks = ""
+        for service in services:
+            port = service['backend_port']
+            websocket = service.get('websocket', False)
+            host_header = service.get('host_header', 'frontend')
+            timeout = service.get('timeout', {'connect': 60, 'send': 60, 'read': 60})
+
+            location_blocks += f'''        location / {{
+            proxy_pass http://host.docker.internal:{port};
+
+'''
+            if host_header == 'backend':
+                location_blocks += f'            proxy_set_header Host host.docker.internal:{port};\n'
+            else:
+                location_blocks += '            proxy_set_header Host $host;\n'
+
+            location_blocks += '''            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            proxy_http_version 1.1;
+'''
+            if websocket:
+                location_blocks += '''            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection $connection_upgrade;
+'''
+            else:
+                location_blocks += '            proxy_set_header Connection "";\n'
+
+            location_blocks += f'''
+            proxy_connect_timeout {timeout.get('connect', 60)}s;
+            proxy_send_timeout {timeout.get('send', 60)}s;
+            proxy_read_timeout {timeout.get('read', 60)}s;
+
+            proxy_buffering off;
+            proxy_request_buffering off;
+        }}
+'''
+            # Only generate one location block (for the primary service)
+            break
+
+        return f'''# NAS Nginx Configuration for IPv6 Direct Access
+# Auto-generated by relay46 deployer
+
+user nginx;
+worker_processes auto;
+error_log /var/log/nginx/error.log notice;
+pid /var/run/nginx.pid;
+
+events {{
+    worker_connections 1024;
+}}
+
+http {{
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                    '$status $body_bytes_sent "$http_referer" '
+                    '"$http_user_agent" "$http_x_forwarded_for"';
+
+    access_log /var/log/nginx/access.log main;
+
+    sendfile on;
+    tcp_nopush on;
+    tcp_nodelay on;
+    keepalive_timeout 65;
+
+    gzip on;
+    gzip_vary on;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types text/plain text/css text/xml application/json application/javascript application/rss+xml application/atom+xml image/svg+xml;
+
+    map $http_upgrade $connection_upgrade {{
+        default upgrade;
+        ''      close;
+    }}
+
+    server {{
+        listen 443 ssl http2;
+        listen [::]:443 ssl http2;
+        server_name {server_names};
+
+        ssl_certificate /etc/nginx/certs/fullchain.crt;
+        ssl_certificate_key /etc/nginx/certs/private.key;
+        ssl_protocols TLSv1.2 TLSv1.3;
+        ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+        ssl_prefer_server_ciphers off;
+        ssl_session_cache shared:SSL:10m;
+        ssl_session_timeout 1d;
+
+{location_blocks}
+    }}
 }}
 '''
 
-            cmd = f"cat > /etc/nginx/conf.d/websocket_map.conf << 'EOFWS'\n{websocket_map}EOFWS"
-            code, _, stderr = self._ssh_cmd(cmd)
-            if code != 0:
-                print(f"✗ WebSocket 映射配置失败: {stderr}")
-                return False
-
-            cmd = f"cat > /etc/nginx/conf.d/nas_proxy.conf << 'EOFTEMP'\n{temp_config}EOFTEMP"
-            code, _, stderr = self._ssh_cmd(cmd)
-            if code != 0:
-                print(f"✗ 临时配置部署失败: {stderr}")
-                return False
-
-            code, _, stderr = self._ssh_cmd("nginx -t && systemctl reload nginx")
-            if code != 0:
-                print(f"✗ Nginx 配置测试失败: {stderr}")
-                return False
-
-            print("✓ HTTP 临时配置部署完成")
-
-        self._full_nginx_config = nginx_config
-        return True
-
-    def deploy_stream_config(self) -> bool:
-        """部署 TCP stream 配置"""
-        tcp_services = self.config.get('tcp_services', [])
-        if not tcp_services:
-            print("⚠ 无 TCP 服务配置，跳过")
-            return True
-
-        print("部署 TCP stream 配置...")
-
-        stream_config = self._generate_stream_config()
-
-        code, _, _ = self._ssh_cmd("mkdir -p /etc/nginx/stream.conf.d")
-        if code != 0:
-            print("✗ 创建 stream 配置目录失败")
-            return False
-
-        cmd = f"cat > /etc/nginx/stream.conf.d/tcp_proxy.conf << 'EOFSTREAM'\n{stream_config}EOFSTREAM"
-        code, _, stderr = self._ssh_cmd(cmd)
-        if code != 0:
-            print(f"✗ Stream 配置部署失败: {stderr}")
-            return False
-
-        code, stdout, _ = self._ssh_cmd("grep -c 'stream.conf.d' /etc/nginx/nginx.conf || echo '0'")
-        if '0' in stdout:
-            stream_include = '''
-# TCP/UDP stream 代理
-stream {
-    include /etc/nginx/stream.conf.d/*.conf;
-}
-'''
-            cmd = f"echo '{stream_include}' >> /etc/nginx/nginx.conf"
-            code, _, stderr = self._ssh_cmd(cmd)
-            if code != 0:
-                print(f"✗ 添加 stream include 失败: {stderr}")
-                return False
-
-        code, _, stderr = self._ssh_cmd("nginx -t && systemctl reload nginx")
-        if code != 0:
-            print(f"✗ Nginx 配置测试失败: {stderr}")
-            return False
-
-        print("✓ TCP stream 配置部署完成")
-        for svc in tcp_services:
-            print(f"    - {svc['name']}: 端口 {svc['listen_port']} -> 后端 {svc['backend_port']}")
-
-        return True
-
-    def request_certificates(self) -> bool:
-        """申请 SSL 证书"""
-        services = self.config.get('services', [])
-        if not services:
-            print("⚠ 无 HTTP 服务，跳过 SSL 证书申请")
-            return True
-
-        print("申请 SSL 证书...")
-
-        domains = [s['domain'] for s in services]
-        domain_args = " ".join([f"-d {d}" for d in domains])
-        email = self.config['ssl']['email']
-
-        cmd = f"certbot --nginx {domain_args} --non-interactive --agree-tos --email {email} --redirect"
-        code, stdout, stderr = self._ssh_cmd(cmd, timeout=180)
-
-        if code == 0:
-            print("✓ SSL 证书申请成功")
-            return True
-        else:
-            print(f"✗ 证书申请失败: {stderr}")
-            print("提示: 请确保域名 DNS 已正确解析到服务器 IP")
-            return False
-
-    def finalize_config(self) -> bool:
-        """部署最终的反向代理配置"""
-        services = self.config.get('services', [])
-        if not services:
-            print("⚠ 无 HTTP 服务配置")
-            return True
-
-        print("部署最终 HTTP 配置...")
-
-        cmd = f"cat > /etc/nginx/conf.d/nas_proxy.conf << 'EOFFINAL'\n{self._full_nginx_config}EOFFINAL"
-        code, _, stderr = self._ssh_cmd(cmd)
-        if code != 0:
-            print(f"✗ 配置部署失败: {stderr}")
-            return False
-
-        code, stdout, stderr = self._ssh_cmd("nginx -t && systemctl reload nginx")
-        if code != 0:
-            print(f"✗ Nginx 配置测试失败: {stderr}")
-            return False
-
-        print("✓ HTTP 配置部署完成")
-        return True
-
-    def setup_nas_ddns(self) -> bool:
-        """在 NAS 上部署 Cloudflare DDNS 更新脚本"""
-        cf_config = self.config.get('cloudflare', {})
-        nas_config = self.config.get('nas')
-
-        if not cf_config.get('enabled', False):
-            print("⚠ Cloudflare DNS 未启用，跳过 NAS DDNS 配置")
-            return True
-
-        if not nas_config:
-            print("⚠ 未配置 NAS，跳过 DDNS 配置")
-            return True
-
-        print("部署 NAS DDNS 更新脚本...")
-
-        services = self.config.get('services', [])
-        if not services:
-            print("⚠ 无 HTTP 服务，跳过 DDNS 配置")
-            return True
-
-        api_token = cf_config.get('api_token', '')
-        zone_id = cf_config.get('zone_id', '')
-        proxied = 'true' if cf_config.get('proxied', False) else 'false'
-        domains = ' '.join([s['domain'] for s in services])
-
-        nas_user = nas_config['user']
-
-        # Generate the DDNS update script
-        ddns_script = f'''#!/bin/bash
+    def _generate_nas_ddns_script(self) -> str:
+        """Generate DDNS update script for NAS"""
+        return '''#!/bin/sh
 # Cloudflare DDNS Update Script for NAS IPv6
 # Auto-generated by relay46 deployer
-# Updates AAAA records when IPv6 address changes
 
-CF_API_TOKEN="{api_token}"
-CF_ZONE_ID="{zone_id}"
-DOMAINS="{domains}"
-PROXIED={proxied}
-LOG_FILE="/home/{nas_user}/cloudflare-ddns.log"
+LOG_FILE="/var/log/ddns/ddns.log"
 IP_CACHE_FILE="/tmp/cloudflare-ddns-ipv6.cache"
 
-# Get current IPv6 address
-get_current_ipv6() {{
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+get_current_ipv6() {
     curl -6 -s --connect-timeout 10 ifconfig.me 2>/dev/null || \\
     curl -6 -s --connect-timeout 10 icanhazip.com 2>/dev/null || \\
     curl -6 -s --connect-timeout 10 ipv6.ip.sb 2>/dev/null
-}}
+}
 
-# Get cached IPv6 address
-get_cached_ipv6() {{
+get_cached_ipv6() {
     if [ -f "$IP_CACHE_FILE" ]; then
         cat "$IP_CACHE_FILE"
     fi
-}}
+}
 
-# Update DNS record
-update_dns_record() {{
+update_dns_record() {
     local domain="$1"
     local ipv6="$2"
 
-    # Get existing record
     local response=$(curl -s -X GET \\
         "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records?type=AAAA&name=$domain" \\
         -H "Authorization: Bearer $CF_API_TOKEN" \\
@@ -753,55 +680,53 @@ update_dns_record() {{
     local record_id=$(echo "$response" | grep -o '"id":"[^"]*"' | head -1 | cut -d'"' -f4)
 
     if [ -n "$record_id" ]; then
-        # Update existing record
         local update_response=$(curl -s -X PUT \\
             "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records/$record_id" \\
             -H "Authorization: Bearer $CF_API_TOKEN" \\
             -H "Content-Type: application/json" \\
-            --data '{{"type":"AAAA","name":"'$domain'","content":"'$ipv6'","proxied":'$PROXIED',"ttl":1}}')
+            --data '{"type":"AAAA","name":"'$domain'","content":"'$ipv6'","proxied":'$PROXIED',"ttl":1}')
 
         if echo "$update_response" | grep -q '"success":true'; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Updated $domain AAAA -> $ipv6" >> "$LOG_FILE"
+            log "Updated $domain AAAA -> $ipv6"
             return 0
         else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to update $domain: $update_response" >> "$LOG_FILE"
+            log "Failed to update $domain: $update_response"
             return 1
         fi
     else
-        # Create new record
         local create_response=$(curl -s -X POST \\
             "https://api.cloudflare.com/client/v4/zones/$CF_ZONE_ID/dns_records" \\
             -H "Authorization: Bearer $CF_API_TOKEN" \\
             -H "Content-Type: application/json" \\
-            --data '{{"type":"AAAA","name":"'$domain'","content":"'$ipv6'","proxied":'$PROXIED',"ttl":1}}')
+            --data '{"type":"AAAA","name":"'$domain'","content":"'$ipv6'","proxied":'$PROXIED',"ttl":1}')
 
         if echo "$create_response" | grep -q '"success":true'; then
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Created $domain AAAA -> $ipv6" >> "$LOG_FILE"
+            log "Created $domain AAAA -> $ipv6"
             return 0
         else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S')] Failed to create $domain: $create_response" >> "$LOG_FILE"
+            log "Failed to create $domain: $create_response"
             return 1
         fi
     fi
-}}
+}
 
-# Main logic
-main() {{
+main() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+
     local current_ipv6=$(get_current_ipv6)
 
     if [ -z "$current_ipv6" ]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S')] ERROR: Failed to get current IPv6 address" >> "$LOG_FILE"
+        log "ERROR: Failed to get current IPv6 address"
         exit 1
     fi
 
     local cached_ipv6=$(get_cached_ipv6)
 
     if [ "$current_ipv6" = "$cached_ipv6" ]; then
-        # IP unchanged, skip update
         exit 0
     fi
 
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] IPv6 changed: $cached_ipv6 -> $current_ipv6" >> "$LOG_FILE"
+    log "IPv6 changed: $cached_ipv6 -> $current_ipv6"
 
     local success=true
     for domain in $DOMAINS; do
@@ -813,246 +738,532 @@ main() {{
     if [ "$success" = true ]; then
         echo "$current_ipv6" > "$IP_CACHE_FILE"
     fi
-}}
+}
 
 main "$@"
 '''
 
-        # Deploy script to NAS
-        nas_user = nas_config['user']
-        script_path = f"/home/{nas_user}/cloudflare-ddns.sh"
+    def _generate_nas_env_file(self) -> str:
+        """Generate .env file for NAS DDNS"""
+        cf_config = self.config.get('cloudflare', {})
+        services = self.config.get('services', [])
+        backend = self.config['backend']['host']
 
-        cmd = f"cat > {script_path} << 'EOFDDNS'\n{ddns_script}EOFDDNS"
-        code, _, stderr = self._ssh_cmd(cmd, target="nas")
-        if code != 0:
-            print(f"✗ DDNS 脚本部署失败: {stderr}")
+        domains = [s['domain'] for s in services]
+        if backend not in domains:
+            domains.append(backend)
+
+        return f'''# Cloudflare DDNS Configuration
+CF_API_TOKEN={cf_config.get('api_token', '')}
+CF_ZONE_ID={cf_config.get('zone_id', '')}
+DOMAINS={' '.join(domains)}
+PROXIED={'true' if cf_config.get('proxied', False) else 'false'}
+'''
+
+    # =========================================================================
+    # Deployment Functions
+    # =========================================================================
+
+    def test_connection(self, target: str = "server") -> bool:
+        """Test SSH connection"""
+        cfg = self.config['server'] if target == "server" else self.config.get('nas', {})
+        host = cfg.get('host', 'unknown')
+        print(f"Testing connection to {host}...")
+
+        code, stdout, stderr = self._ssh_cmd("echo 'Connection OK' && uname -a", target=target)
+
+        if code == 0:
+            print(f"  Connection successful")
+            return True
+        else:
+            print(f"  Connection failed: {stderr}")
             return False
 
-        # Make executable
-        self._ssh_cmd(f"chmod +x {script_path}", target="nas")
+    def check_docker_installed(self, target: str = "server") -> bool:
+        """Check if Docker and Docker Compose are installed"""
+        code, stdout, stderr = self._ssh_cmd("docker --version && docker compose version", target=target)
+        return code == 0
 
-        # Setup cron job (every 5 minutes)
-        cron_entry = f"*/5 * * * * {script_path} >/dev/null 2>&1"
-        cron_cmd = f'(crontab -l 2>/dev/null | grep -v "cloudflare-ddns.sh"; echo "{cron_entry}") | crontab -'
-        code, _, stderr = self._ssh_cmd(cron_cmd, target="nas")
-        if code != 0:
-            print(f"⚠ Cron 配置失败: {stderr}")
-            print(f"  请手动添加 cron: {cron_entry}")
-        else:
-            print("✓ Cron 定时任务已配置 (每 5 分钟检查)")
+    def install_docker(self, target: str = "server") -> bool:
+        """Install Docker on the target"""
+        print("Installing Docker...")
 
-        # Run once immediately
-        code, _, _ = self._ssh_cmd(script_path, target="nas")
-        if code == 0:
-            print(f"✓ DDNS 脚本已部署到 NAS: {script_path}")
-        else:
-            print(f"⚠ DDNS 脚本首次运行失败，请检查配置")
+        commands = [
+            "curl -fsSL https://get.docker.com | sh",
+            "systemctl enable docker",
+            "systemctl start docker"
+        ]
 
+        for cmd in commands:
+            code, stdout, stderr = self._ssh_cmd(cmd, target=target, timeout=300)
+            if code != 0:
+                print(f"  Failed to install Docker: {stderr}")
+                return False
+
+        print("  Docker installed successfully")
         return True
 
-    def setup_cert_sync(self) -> bool:
-        """配置证书同步到 NAS"""
-        nas_config = self.config.get('nas')
-        if not nas_config:
-            print("⚠ 未配置 NAS，跳过证书同步设置")
-            return True
-
-        print("配置证书同步...")
-
+    def check_certs_exist(self) -> bool:
+        """Check if SSL certificates already exist on VPS"""
         services = self.config.get('services', [])
         if not services:
             return True
 
         domain = services[0]['domain']
-        nas_host = nas_config['host']
-        nas_user = nas_config['user']
+        code, stdout, stderr = self._ssh_cmd(
+            f"test -f {self.VPS_DEPLOY_PATH}/certs/live/{domain}/fullchain.pem && echo 'exists'"
+        )
+        return code == 0 and 'exists' in stdout
 
-        sync_script = f'''#!/bin/bash
-# SSL 证书同步脚本 - 同步到 NAS Docker Nginx
+    def get_vps_ipv4(self) -> str:
+        """Get VPS IPv4 address"""
+        import re
+        server_host = self.config['server']['host']
+        ipv4_pattern = r'^(\d{1,3}\.){3}\d{1,3}$'
 
-DOMAIN="{domain}"
-NAS_HOST="{nas_host}"
-NAS_USER="{nas_user}"
-CERT_DIR="/etc/letsencrypt/live/${{DOMAIN}}"
-NAS_CERT_DIR="/home/${{NAS_USER}}/nginx-proxy/certs"
+        if re.match(ipv4_pattern, server_host):
+            return server_host
 
-if [ ! -f "${{CERT_DIR}}/fullchain.pem" ]; then
-    echo "错误: 证书不存在"
-    exit 1
-fi
+        code, stdout, stderr = self._ssh_cmd("curl -4 -s --connect-timeout 10 ifconfig.me")
+        if code == 0 and stdout.strip():
+            ip = stdout.strip()
+            if re.match(ipv4_pattern, ip):
+                return ip
 
-echo "[$(date)] 同步证书到 NAS..."
-scp ${{CERT_DIR}}/fullchain.pem ${{NAS_USER}}@${{NAS_HOST}}:${{NAS_CERT_DIR}}/fullchain.crt
-scp ${{CERT_DIR}}/privkey.pem ${{NAS_USER}}@${{NAS_HOST}}:${{NAS_CERT_DIR}}/private.key
-ssh ${{NAS_USER}}@${{NAS_HOST}} "docker exec nginx-proxy nginx -s reload 2>/dev/null || true"
-echo "[$(date)] 同步完成!"
-'''
+        raise RuntimeError(f"Failed to get VPS IPv4 address: {stderr}")
 
-        cmd = f"cat > /usr/local/bin/sync-cert-to-nas.sh << 'EOFSYNC'\n{sync_script}EOFSYNC"
-        code, _, _ = self._ssh_cmd(cmd)
-        if code != 0:
-            print("⚠ 同步脚本创建失败")
+    def get_nas_ipv6(self) -> str:
+        """Get NAS IPv6 address"""
+        nas_config = self.config.get('nas', {})
+        if nas_config.get('ipv6'):
+            return nas_config['ipv6']
+
+        nas_host = nas_config.get('host', self.config['backend']['host'])
+
+        code, stdout, stderr = self._ssh_cmd(f"dig +short AAAA {nas_host} | head -1")
+        if code == 0 and stdout.strip() and ':' in stdout.strip():
+            return stdout.strip()
+
+        code, stdout, stderr = self._ssh_cmd("curl -6 -s --connect-timeout 10 ifconfig.me", target="nas")
+        if code == 0 and stdout.strip() and ':' in stdout.strip():
+            return stdout.strip()
+
+        raise RuntimeError(f"Failed to get NAS IPv6 address: {stderr}")
+
+    def _cloudflare_api(self, method: str, endpoint: str, data: dict = None) -> dict:
+        """Call Cloudflare API"""
+        cf_config = self.config.get('cloudflare', {})
+        api_token = cf_config.get('api_token', '')
+        base_url = "https://api.cloudflare.com/client/v4"
+
+        url = f"{base_url}{endpoint}"
+        headers = {
+            "Authorization": f"Bearer {api_token}",
+            "Content-Type": "application/json"
+        }
+
+        request_data = json.dumps(data).encode('utf-8') if data else None
+        req = urllib.request.Request(url, data=request_data, headers=headers, method=method)
+
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response:
+                return json.loads(response.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            error_body = e.read().decode('utf-8')
+            raise RuntimeError(f"Cloudflare API error ({e.code}): {error_body}")
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"Cloudflare API network error: {e.reason}")
+
+    def update_cloudflare_dns(self) -> bool:
+        """Update Cloudflare DNS records"""
+        cf_config = self.config.get('cloudflare', {})
+
+        if not cf_config.get('enabled', False):
+            print("  Cloudflare DNS not enabled, skipping")
             return True
 
-        self._ssh_cmd("chmod +x /usr/local/bin/sync-cert-to-nas.sh")
+        if not cf_config.get('api_token') or not cf_config.get('zone_id'):
+            print("  Cloudflare config incomplete, skipping")
+            return True
 
-        # 配置 deploy hook
-        hook_script = '''#!/bin/bash
-/usr/local/bin/sync-cert-to-nas.sh >> /var/log/cert-sync.log 2>&1
-'''
-        cmd = f"mkdir -p /etc/letsencrypt/renewal-hooks/deploy && cat > /etc/letsencrypt/renewal-hooks/deploy/sync-to-nas.sh << 'EOFHOOK'\n{hook_script}EOFHOOK"
-        self._ssh_cmd(cmd)
-        self._ssh_cmd("chmod +x /etc/letsencrypt/renewal-hooks/deploy/sync-to-nas.sh")
+        print("Updating Cloudflare DNS records...")
 
-        print("✓ 证书同步配置完成")
+        try:
+            vps_ipv4 = self.get_vps_ipv4()
+            print(f"  VPS IPv4: {vps_ipv4}")
+        except RuntimeError as e:
+            print(f"  {e}")
+            return False
+
+        try:
+            nas_ipv6 = self.get_nas_ipv6()
+            print(f"  NAS IPv6: {nas_ipv6}")
+        except RuntimeError as e:
+            print(f"  {e}")
+            return False
+
+        zone_id = cf_config['zone_id']
+        proxied = cf_config.get('proxied', False)
+
+        services = self.config.get('services', [])
+        for service in services:
+            domain = service['domain']
+            print(f"  Processing domain: {domain}")
+
+            # Update A record
+            try:
+                endpoint = f"/zones/{zone_id}/dns_records?type=A&name={domain}"
+                result = self._cloudflare_api("GET", endpoint)
+
+                if result.get('success') and result.get('result'):
+                    record = result['result'][0]
+                    if record['content'] != vps_ipv4:
+                        self._cloudflare_api("PUT", f"/zones/{zone_id}/dns_records/{record['id']}", {
+                            "type": "A", "name": domain, "content": vps_ipv4, "proxied": proxied, "ttl": 1
+                        })
+                        print(f"    A record updated: {vps_ipv4}")
+                    else:
+                        print(f"    A record already up to date")
+                else:
+                    self._cloudflare_api("POST", f"/zones/{zone_id}/dns_records", {
+                        "type": "A", "name": domain, "content": vps_ipv4, "proxied": proxied, "ttl": 1
+                    })
+                    print(f"    A record created: {vps_ipv4}")
+            except RuntimeError as e:
+                print(f"    A record failed: {e}")
+
+            # Update AAAA record
+            try:
+                endpoint = f"/zones/{zone_id}/dns_records?type=AAAA&name={domain}"
+                result = self._cloudflare_api("GET", endpoint)
+
+                if result.get('success') and result.get('result'):
+                    record = result['result'][0]
+                    if record['content'] != nas_ipv6:
+                        self._cloudflare_api("PUT", f"/zones/{zone_id}/dns_records/{record['id']}", {
+                            "type": "AAAA", "name": domain, "content": nas_ipv6, "proxied": proxied, "ttl": 1
+                        })
+                        print(f"    AAAA record updated: {nas_ipv6}")
+                    else:
+                        print(f"    AAAA record already up to date")
+                else:
+                    self._cloudflare_api("POST", f"/zones/{zone_id}/dns_records", {
+                        "type": "AAAA", "name": domain, "content": nas_ipv6, "proxied": proxied, "ttl": 1
+                    })
+                    print(f"    AAAA record created: {nas_ipv6}")
+            except RuntimeError as e:
+                print(f"    AAAA record failed: {e}")
+
+        return True
+
+    def deploy_vps(self) -> bool:
+        """Deploy Docker Compose setup to VPS"""
+        print("Deploying to VPS...")
+
+        # Create temp directory with all files
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+
+            # Create directory structure
+            (tmppath / "nginx" / "conf.d").mkdir(parents=True)
+            (tmppath / "nginx" / "stream.conf.d").mkdir(parents=True)
+            (tmppath / "webroot" / ".well-known" / "acme-challenge").mkdir(parents=True)
+
+            # Generate files
+            (tmppath / "docker-compose.yaml").write_text(self._generate_vps_docker_compose())
+            (tmppath / "nginx" / "nginx.conf").write_text(self._generate_vps_nginx_main_conf())
+            (tmppath / "nginx" / "stream.conf.d" / "tcp_proxy.conf").write_text(self._generate_vps_stream_conf())
+            (tmppath / "sync-cert-to-nas.sh").write_text(self._generate_vps_sync_script())
+
+            # Check if certs exist
+            certs_exist = self.check_certs_exist()
+
+            if certs_exist:
+                # Deploy with full SSL config
+                (tmppath / "nginx" / "conf.d" / "nas_proxy.conf").write_text(
+                    self._generate_vps_http_proxy_conf(with_ssl=True)
+                )
+            else:
+                # Deploy with temporary config for cert request
+                (tmppath / "nginx" / "conf.d" / "nas_proxy.conf").write_text(
+                    self._generate_vps_http_proxy_conf(with_ssl=False)
+                )
+
+            # Create remote directory
+            self._ssh_cmd(f"mkdir -p {self.VPS_DEPLOY_PATH}")
+
+            # Upload files
+            print("  Uploading configuration files...")
+            code, _, stderr = self._scp_dir(str(tmppath) + "/.", self.VPS_DEPLOY_PATH)
+            if code != 0:
+                print(f"  Failed to upload files: {stderr}")
+                return False
+
+            # Make sync script executable
+            self._ssh_cmd(f"chmod +x {self.VPS_DEPLOY_PATH}/sync-cert-to-nas.sh")
+
+        # Configure firewall
+        print("  Configuring firewall...")
+        tcp_services = self.config.get('tcp_services', [])
+        ufw_commands = ["ufw allow 80/tcp", "ufw allow 443/tcp"]
+        for svc in tcp_services:
+            ufw_commands.append(f"ufw allow {svc['listen_port']}/tcp")
+        ufw_commands.extend(["ufw --force enable", "ufw reload"])
+        self._ssh_cmd(" && ".join(ufw_commands))
+
+        # Start containers
+        print("  Starting Docker containers...")
+        code, stdout, stderr = self._ssh_cmd(
+            f"cd {self.VPS_DEPLOY_PATH} && docker compose up -d nginx-proxy",
+            timeout=180
+        )
+        if code != 0:
+            print(f"  Failed to start containers: {stderr}")
+            return False
+
+        # Request certificates if needed
+        if not certs_exist:
+            print("  Requesting SSL certificates...")
+            services = self.config.get('services', [])
+            if services:
+                domains = " ".join([f"-d {s['domain']}" for s in services])
+                email = self.config['ssl']['email']
+
+                cert_cmd = (
+                    f"cd {self.VPS_DEPLOY_PATH} && "
+                    f"docker compose run --rm certbot certonly --webroot "
+                    f"-w /var/www/certbot {domains} --email {email} "
+                    f"--agree-tos --non-interactive"
+                )
+                code, stdout, stderr = self._ssh_cmd(cert_cmd, timeout=180)
+
+                if code != 0:
+                    print(f"  Certificate request failed: {stderr}")
+                    print("  Ensure DNS records are correctly configured")
+                    return False
+
+                # Update nginx config with SSL
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.conf', delete=False) as f:
+                    f.write(self._generate_vps_http_proxy_conf(with_ssl=True))
+                    temp_conf = f.name
+
+                self._scp_file(temp_conf, f"{self.VPS_DEPLOY_PATH}/nginx/conf.d/nas_proxy.conf")
+                os.unlink(temp_conf)
+
+                # Reload nginx
+                self._ssh_cmd(f"cd {self.VPS_DEPLOY_PATH} && docker compose exec nginx-proxy nginx -s reload")
+
+        print("  VPS deployment complete")
+        return True
+
+    def deploy_nas(self) -> bool:
+        """Deploy Docker Compose setup to NAS"""
+        nas_config = self.config.get('nas')
+        if not nas_config:
+            print("  No NAS configured, skipping")
+            return True
+
+        print("Deploying to NAS...")
+
+        nas_deploy_path = nas_config.get('deploy_path', self.NAS_DEPLOY_PATH_DEFAULT)
+
+        # Create temp directory with all files
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmppath = Path(tmpdir)
+
+            # Create directory structure
+            (tmppath / "nginx").mkdir(parents=True)
+            (tmppath / "certs").mkdir(parents=True)
+            (tmppath / "logs").mkdir(parents=True)
+
+            # Generate files
+            (tmppath / "docker-compose.yaml").write_text(self._generate_nas_docker_compose())
+            (tmppath / "nginx" / "nginx.conf").write_text(self._generate_nas_nginx_conf())
+
+            cf_config = self.config.get('cloudflare', {})
+            if cf_config.get('enabled', False):
+                (tmppath / "ddns-script.sh").write_text(self._generate_nas_ddns_script())
+                (tmppath / ".env").write_text(self._generate_nas_env_file())
+
+            # Create remote directory
+            self._ssh_cmd(f"mkdir -p {nas_deploy_path}", target="nas")
+
+            # Upload files
+            print("  Uploading configuration files...")
+            code, _, stderr = self._scp_dir(str(tmppath) + "/.", nas_deploy_path, target="nas")
+            if code != 0:
+                print(f"  Failed to upload files: {stderr}")
+                return False
+
+            # Make ddns script executable
+            if cf_config.get('enabled', False):
+                self._ssh_cmd(f"chmod +x {nas_deploy_path}/ddns-script.sh", target="nas")
+
+        # Sync certificates from VPS
+        print("  Syncing certificates from VPS...")
+        code, _, _ = self._ssh_cmd(f"{self.VPS_DEPLOY_PATH}/sync-cert-to-nas.sh")
+        if code != 0:
+            print("  Warning: Certificate sync failed, NAS nginx may not start properly")
+
+        # Start containers
+        print("  Starting Docker containers...")
+        code, stdout, stderr = self._ssh_cmd(
+            f"cd {nas_deploy_path} && docker compose up -d",
+            target="nas",
+            timeout=180
+        )
+        if code != 0:
+            print(f"  Failed to start containers: {stderr}")
+            return False
+
+        print("  NAS deployment complete")
+        return True
+
+    def setup_cron(self) -> bool:
+        """Setup cron job for certificate renewal on VPS"""
+        print("Setting up certificate renewal cron job...")
+
+        cron_entry = f'0 0,12 * * * cd {self.VPS_DEPLOY_PATH} && docker compose run --rm certbot renew --webroot -w /var/www/certbot && docker compose exec nginx-proxy nginx -s reload && {self.VPS_DEPLOY_PATH}/sync-cert-to-nas.sh >> /var/log/cert-renewal.log 2>&1'
+
+        cron_cmd = f'(crontab -l 2>/dev/null | grep -v "relay46"; echo "{cron_entry}") | crontab -'
+        code, _, stderr = self._ssh_cmd(cron_cmd)
+
+        if code != 0:
+            print(f"  Failed to setup cron: {stderr}")
+            return False
+
+        print("  Cron job configured (runs twice daily)")
         return True
 
     def verify_deployment(self) -> bool:
-        """验证部署"""
-        print("验证部署...")
+        """Verify deployment"""
+        print("Verifying deployment...")
 
-        code, stdout, _ = self._ssh_cmd("systemctl is-active nginx")
-        if code == 0 and "active" in stdout:
-            print("✓ Nginx 运行正常")
+        # Check VPS containers
+        code, stdout, _ = self._ssh_cmd(f"cd {self.VPS_DEPLOY_PATH} && docker compose ps --format json")
+        if code == 0:
+            print("  VPS containers running")
         else:
-            print("✗ Nginx 未运行")
-            return False
+            print("  VPS containers not running properly")
 
-        services = self.config.get('services', [])
-        if services:
-            code, stdout, _ = self._ssh_cmd("certbot certificates 2>/dev/null | grep -E 'Domains:|Expiry'")
+        # Check NAS containers if configured
+        nas_config = self.config.get('nas')
+        if nas_config:
+            nas_deploy_path = nas_config.get('deploy_path', self.NAS_DEPLOY_PATH_DEFAULT)
+            code, stdout, _ = self._ssh_cmd(f"cd {nas_deploy_path} && docker compose ps --format json", target="nas")
             if code == 0:
-                print("✓ SSL 证书状态:")
-                for line in stdout.strip().split('\n'):
-                    print(f"    {line.strip()}")
-
-        tcp_services = self.config.get('tcp_services', [])
-        if tcp_services:
-            code, stdout, _ = self._ssh_cmd("ss -tlnp | grep nginx")
-            for svc in tcp_services:
-                port = svc['listen_port']
-                if f":{port}" in stdout:
-                    print(f"✓ TCP 端口 {port} ({svc['name']}) 监听正常")
+                print("  NAS containers running")
+            else:
+                print("  NAS containers not running properly")
 
         return True
 
     def print_summary(self):
-        """打印部署总结"""
+        """Print deployment summary"""
         print("\n" + "=" * 50)
-        print("部署完成!")
+        print("Deployment Complete!")
         print("=" * 50)
 
         services = self.config.get('services', [])
         tcp_services = self.config.get('tcp_services', [])
+        nas_config = self.config.get('nas')
 
         if services:
-            print("\nHTTP/HTTPS 服务:")
+            print("\nHTTP/HTTPS Services:")
             for service in services:
                 print(f"  - {service['name']}: https://{service['domain']}")
 
         if tcp_services:
-            print("\nTCP 服务:")
+            print("\nTCP Services:")
             server_host = self.config['server']['host']
             for svc in tcp_services:
                 print(f"  - {svc['name']}: {server_host}:{svc['listen_port']}")
 
-        print("\n配置文件位置 (远程服务器):")
-        print("  - /etc/nginx/conf.d/nas_proxy.conf")
-        if tcp_services:
-            print("  - /etc/nginx/stream.conf.d/tcp_proxy.conf")
+        print(f"\nVPS Configuration: {self.VPS_DEPLOY_PATH}/")
+        if nas_config:
+            nas_deploy_path = nas_config.get('deploy_path', self.NAS_DEPLOY_PATH_DEFAULT)
+            print(f"NAS Configuration: {nas_deploy_path}/")
 
-        cf_enabled = self.config.get('cloudflare', {}).get('enabled', False)
-        nas_config = self.config.get('nas')
-        if cf_enabled and nas_config:
-            nas_user = nas_config['user']
-            print(f"\nNAS DDNS 脚本:")
-            print(f"  - /home/{nas_user}/cloudflare-ddns.sh (每 5 分钟自动运行)")
-            print(f"  - 日志: /home/{nas_user}/cloudflare-ddns.log")
+        print("\nUseful Commands:")
+        print(f"  # VPS: Check status")
+        print(f"  ssh vps 'cd {self.VPS_DEPLOY_PATH} && docker compose ps'")
+        print(f"  # VPS: View logs")
+        print(f"  ssh vps 'cd {self.VPS_DEPLOY_PATH} && docker compose logs -f'")
+        if nas_config:
+            nas_deploy_path = nas_config.get('deploy_path', self.NAS_DEPLOY_PATH_DEFAULT)
+            print(f"  # NAS: Check status")
+            print(f"  ssh nas 'cd {nas_deploy_path} && docker compose ps'")
 
-    def deploy(self):
-        """执行完整部署"""
+    def deploy(self) -> bool:
+        """Execute full deployment"""
         services = self.config.get('services', [])
         tcp_services = self.config.get('tcp_services', [])
         cf_enabled = self.config.get('cloudflare', {}).get('enabled', False)
+        nas_config = self.config.get('nas')
 
-        total_steps = 4
+        total_steps = 5  # connection, docker check, vps deploy, verify, cron
         if cf_enabled:
-            total_steps += 2  # DNS update step + NAS DDNS setup
-        if services:
-            total_steps += 4  # HTTP 配置、证书、最终配置、同步设置
-        if tcp_services:
+            total_steps += 1
+        if nas_config:
             total_steps += 1
 
         print("\n" + "=" * 50)
-        print("Nginx 反向代理一键部署")
+        print("Relay46 Docker Compose Deployment")
         print("=" * 50)
-        print(f"目标服务器: {self.config['server']['host']}")
-        print(f"后端地址: {self.config['backend']['host']}")
-        print(f"HTTP 服务: {len(services)}, TCP 服务: {len(tcp_services)}")
+        print(f"VPS: {self.config['server']['host']}")
+        print(f"Backend: {self.config['backend']['host']}")
+        print(f"HTTP Services: {len(services)}, TCP Services: {len(tcp_services)}")
         if cf_enabled:
-            print(f"Cloudflare DNS: 已启用")
+            print("Cloudflare DNS: Enabled")
 
         current_step = 0
 
+        # Step 1: Test connection
         current_step += 1
-        self._print_step(current_step, total_steps, "测试 SSH 连接")
+        self._print_step(current_step, total_steps, "Testing SSH Connection")
         if not self.test_connection():
             return False
 
+        # Step 2: Check/Install Docker
+        current_step += 1
+        self._print_step(current_step, total_steps, "Checking Docker Installation")
+        if not self.check_docker_installed():
+            print("  Docker not found, installing...")
+            if not self.install_docker():
+                return False
+        else:
+            print("  Docker is installed")
+
+        # Step 3: Update Cloudflare DNS
         if cf_enabled:
             current_step += 1
-            self._print_step(current_step, total_steps, "更新 Cloudflare DNS")
-            if not self.update_cloudflare_dns():
-                return False
+            self._print_step(current_step, total_steps, "Updating Cloudflare DNS")
+            self.update_cloudflare_dns()
 
+        # Step 4: Deploy VPS
         current_step += 1
-        self._print_step(current_step, total_steps, "安装软件包")
-        if not self.install_packages():
+        self._print_step(current_step, total_steps, "Deploying VPS")
+        if not self.deploy_vps():
             return False
 
+        # Step 5: Deploy NAS
+        if nas_config:
+            current_step += 1
+            self._print_step(current_step, total_steps, "Deploying NAS")
+            if not self.deploy_nas():
+                return False
+
+        # Step 6: Setup cron
         current_step += 1
-        self._print_step(current_step, total_steps, "配置防火墙")
-        if not self.configure_firewall():
-            return False
+        self._print_step(current_step, total_steps, "Setting Up Certificate Renewal")
+        self.setup_cron()
 
-        if services:
-            current_step += 1
-            self._print_step(current_step, total_steps, "部署 Nginx HTTP 配置")
-            if not self.deploy_nginx_config():
-                return False
-
-            current_step += 1
-            self._print_step(current_step, total_steps, "申请 SSL 证书")
-            if not self.request_certificates():
-                return False
-
-            current_step += 1
-            self._print_step(current_step, total_steps, "部署最终 HTTP 配置")
-            if not self.finalize_config():
-                return False
-
-            current_step += 1
-            self._print_step(current_step, total_steps, "配置证书同步")
-            if not self.setup_cert_sync():
-                return False
-
-        if cf_enabled:
-            current_step += 1
-            self._print_step(current_step, total_steps, "部署 NAS DDNS 脚本")
-            if not self.setup_nas_ddns():
-                return False
-
-        if tcp_services:
-            current_step += 1
-            self._print_step(current_step, total_steps, "部署 TCP stream 配置")
-            if not self.deploy_stream_config():
-                return False
-
+        # Step 7: Verify
         current_step += 1
-        self._print_step(current_step, total_steps, "验证部署")
+        self._print_step(current_step, total_steps, "Verifying Deployment")
         self.verify_deployment()
-        self.print_summary()
 
+        self.print_summary()
         return True
 
 
@@ -1062,7 +1273,7 @@ def main():
 
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
 
-    deployer = NginxProxyDeployer(config_path)
+    deployer = Relay46Deployer(config_path)
     success = deployer.deploy()
 
     sys.exit(0 if success else 1)
