@@ -115,6 +115,11 @@ tcp_services:     # TCP service list
   - name: "ssh"
     listen_port: 2222
     backend_port: 22
+
+  - name: "istoreos-ssh"        # TCP service with local_backend
+    listen_port: 2223
+    backend_port: 2223          # VPS connects to NAS on this port
+    local_backend: "192.168.0.2:22"  # NAS proxies to this local address
 ```
 
 ## Deployment Script (deploy.py)
@@ -127,8 +132,8 @@ tcp_services:     # TCP service list
 - `_generate_vps_http_proxy_conf()` - HTTP/HTTPS proxy rules
 - `_generate_vps_stream_conf()` - TCP stream proxy rules
 - `_generate_vps_sync_script()` - Certificate sync script
-- `_generate_nas_docker_compose()` - NAS docker-compose.yaml (auto-exposes ports for local_backend services)
-- `_generate_nas_nginx_conf()` - NAS nginx config (adds HTTP relay blocks for local_backend services)
+- `_generate_nas_docker_compose()` - NAS docker-compose.yaml (auto-exposes ports for local_backend HTTP/TCP services)
+- `_generate_nas_nginx_conf()` - NAS nginx config (HTTP relay blocks + TCP stream blocks for local_backend services)
 - `_generate_nas_ddns_script()` - DDNS update script
 
 **Certificate Management:**
