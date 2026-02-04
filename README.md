@@ -47,7 +47,12 @@ pip3 install pyyaml
 ```yaml
 server:
   host: "YOUR_VPS_IP"
+  port: 22
   user: "root"
+  # 可选: VPS HTTP/HTTPS 监听端口（默认 80/443）
+  # 当 443 被其他服务占用时，可改为 8444 等端口
+  http_port: 80
+  https_port: 443
   # identity_file: "~/.ssh/id_ed25519"
 ```
 
@@ -97,7 +102,7 @@ cloudflare:
                     │         VPS (host network)          │
                     │  ┌─────────────────────────────┐    │
 IPv4 Client ──────► │  │  nginx-proxy (Docker)       │    │
-      :443          │  │  - HTTP/HTTPS reverse proxy │────┼───► NAS Backend
+      :443(*)       │  │  - HTTP/HTTPS reverse proxy │────┼───► NAS Backend
       :2222         │  │  - TCP stream proxy (IPv6)  │    │     (via IPv6)
                     │  └─────────────────────────────┘    │
                     │  ┌─────────────────────────────┐    │
@@ -218,3 +223,4 @@ If upgrading from the system-level nginx installation:
 5. Certificates auto-renew and sync to NAS twice daily
 6. DDNS updater checks every 5 minutes for IPv6 changes
 7. First deployment may require manual cert sync to NAS
+8. `:443` 可通过 `server.https_port` 修改为其他端口

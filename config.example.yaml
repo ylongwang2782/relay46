@@ -19,6 +19,10 @@ server:
   host: "YOUR_VPS_IP"
   port: 22
   user: "root"
+  # 可选: VPS HTTP/HTTPS 监听端口（默认 80/443）
+  # 当 443 被其他服务占用时，可改为 8444 等端口
+  http_port: 80
+  https_port: 443
   # 可选: 指定 SSH 密钥路径，留空则使用默认密钥
   # identity_file: "~/.ssh/id_ed25519"
 

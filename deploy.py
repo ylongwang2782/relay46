@@ -254,6 +254,10 @@ stream {
         resolver = config['resolver']
         backend = config['backend']
         services = config.get('services', [])
+        server_cfg = config.get('server', {})
+        http_port = int(server_cfg.get('http_port', 80))
+        https_port = int(server_cfg.get('https_port', 443))
+        https_port_suffix = "" if https_port == 443 else f":{https_port}"
 
         if not services:
             return "# No HTTP services configured\n"
@@ -278,8 +282,8 @@ map $http_upgrade $connection_upgrade {{
 
 # ACME challenge server
 server {{
-    listen 80 default_server;
-    listen [::]:80 default_server;
+    listen {http_port} default_server;
+    listen [::]:{http_port} default_server;
     server_name _;
 
     location /.well-known/acme-challenge/ {{
@@ -287,7 +291,7 @@ server {{
     }}
 
     location / {{
-        return 301 https://$host$request_uri;
+        return 301 https://$host{https_port_suffix}$request_uri;
     }}
 }}
 
@@ -298,8 +302,8 @@ server {{
             for service in services:
                 domain = service['domain']
                 nginx_config += f'''server {{
-    listen 80;
-    listen [::]:80;
+    listen {http_port};
+    listen [::]:{http_port};
     server_name {domain};
 
     location /.well-known/acme-challenge/ {{
@@ -331,8 +335,8 @@ server {{
 # {name.upper()}
 # =====================
 server {{
-    listen 443 ssl http2;
-    listen [::]:443 ssl http2;
+    listen {https_port} ssl http2;
+    listen [::]:{https_port} ssl http2;
     server_name {domain};
 
     ssl_certificate /etc/letsencrypt/live/{ssl_domain}/fullchain.pem;
@@ -1232,7 +1236,11 @@ PROXIED={'true' if cf_config.get('proxied', False) else 'false'}
         # Configure firewall
         print("  Configuring firewall...")
         tcp_services = self.config.get('tcp_services', [])
-        ufw_commands = ["ufw allow 80/tcp", "ufw allow 443/tcp"]
+        server_cfg = self.config.get('server', {})
+        http_port = int(server_cfg.get('http_port', 80))
+        https_port = int(server_cfg.get('https_port', 443))
+        ufw_ports = {http_port, https_port}
+        ufw_commands = [f"ufw allow {p}/tcp" for p in sorted(ufw_ports)]
         for svc in tcp_services:
             ufw_commands.append(f"ufw allow {svc['listen_port']}/tcp")
         ufw_commands.extend(["ufw --force enable", "ufw reload"])
@@ -1247,6 +1255,9 @@ PROXIED={'true' if cf_config.get('proxied', False) else 'false'}
         if code != 0:
             print(f"  Failed to start containers: {stderr}")
             return False
+
+        # Reload nginx to apply latest config (ports, hosts, etc.)
+        self._ssh_cmd(f"cd {self.VPS_DEPLOY_PATH} && docker compose exec -T nginx-proxy nginx -s reload")
 
         # Request certificates if needed (new certs or new domains)
         services = self.config.get('services', [])
@@ -1387,9 +1398,12 @@ PROXIED={'true' if cf_config.get('proxied', False) else 'false'}
         nas_config = self.config.get('nas')
 
         if services:
+            server_cfg = self.config.get('server', {})
+            https_port = int(server_cfg.get('https_port', 443))
+            https_port_suffix = "" if https_port == 443 else f":{https_port}"
             print("\nHTTP/HTTPS Services:")
             for service in services:
-                print(f"  - {service['name']}: https://{service['domain']}")
+                print(f"  - {service['name']}: https://{service['domain']}{https_port_suffix}")
 
         if tcp_services:
             print("\nTCP Services:")
