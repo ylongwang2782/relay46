@@ -1,0 +1,90 @@
+# ===========================================
+# Nginx 反向代理一键部署配置文件
+# 复制此文件为 config.yaml 并填写配置
+# ===========================================
+
+# Cloudflare DNS 自动化配置 (可选)
+# 部署时自动更新 DNS 记录:
+#   - A 记录: 服务域名 -> VPS IPv4
+#   - AAAA 记录: 服务域名 -> NAS IPv6
+cloudflare:
+  enabled: false                          # 设为 true 启用 DNS 自动化
+  api_token: "YOUR_CLOUDFLARE_API_TOKEN"  # Zone:DNS:Edit 权限
+  zone_id: "YOUR_ZONE_ID"                 # 域名的 Zone ID (在 Cloudflare 面板查看)
+  proxied: false                          # true=橙色云(CDN代理), false=灰色云(仅DNS)
+
+# 远程服务器配置 (使用 SSH 密钥认证)
+# 部署前请先配置: ssh-copy-id user@host
+server:
+  host: "YOUR_VPS_IP"
+  port: 22
+  user: "root"
+  # 可选: VPS HTTP/HTTPS 监听端口（默认 80/443）
+  # 当 443 被其他服务占用时，可改为 8444 等端口
+  http_port: 80
+  https_port: 443
+  # 可选: 指定 SSH 密钥路径，留空则使用默认密钥
+  # identity_file: "~/.ssh/id_ed25519"
+
+# NAS 配置 (用于 Docker 部署和独立证书申请，可选)
+# NAS 通过 DNS-01 (Cloudflare) 独立申请证书，不依赖 VPS SSH
+nas:
+  host: "nas.example.com"
+  user: "your_nas_user"
+  # identity_file: "~/.ssh/id_ed25519"
+  # ipv6: "2001:db8::1"              # 可选: 手动指定 NAS IPv6 (无法 SSH 获取时使用)
+  # deploy_path: "~/relay46"          # 可选: NAS 上的部署目录 (默认 ~/relay46)
+
+# SSL 证书配置
+ssl:
+  email: "your@email.com"
+
+# 后端 NAS 配置 (IPv6 DDNS 域名)
+backend:
+  host: "nas.example.com"
+
+# DNS 解析器配置
+resolver:
+  servers:
+    - "8.8.8.8"
+    - "8.8.4.4"
+  ipv6: true
+  valid: "300s"
+  timeout: "5s"
+
+# HTTP/HTTPS 代理服务列表
+services:
+  - name: "web-panel"
+    domain: "panel.example.com"
+    backend_port: 5666
+    websocket: true
+    host_header: "frontend"
+    timeout:
+      connect: 60
+      send: 60
+      read: 60
+
+  - name: "download"
+    domain: "dl.example.com"
+    backend_port: 9091
+    websocket: false
+    host_header: "backend"
+    timeout:
+      connect: 60
+      send: 120
+      read: 120
+
+# TCP 流代理 (SSH, 数据库等)
+tcp_services:
+  - name: "ssh"
+    listen_port: 2222
+    backend_port: 22
+    protocol: "tcp"
+
+# =========================================
+# 添加更多服务示例:
+# =========================================
+#  - name: "mysql"
+#    listen_port: 3307
+#    backend_port: 3306
+#    protocol: "tcp"
