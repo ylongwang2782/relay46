@@ -170,6 +170,13 @@ class Relay46Deployer:
         print(f"\n[{step}/{total}] {message}")
         print("=" * 50)
 
+
+    def _get_all_domains(self) -> list:
+        """Get all domains from services and vps_services"""
+        domains = [s['domain'] for s in self.config.get('services', [])]
+        domains += [s['domain'] for s in self.config.get('vps_services', [])]
+        return domains
+
     # =========================================================================
     # VPS File Generation
     # =========================================================================
@@ -383,6 +390,68 @@ server {{
 }}
 
 '''
+
+
+        # Generate VPS-local service server blocks
+        vps_services = self.config.get('vps_services', [])
+        if vps_services and with_ssl:
+            nginx_config += """
+# ===========================================
+# VPS-Local Services
+# ===========================================
+
+"""
+            for svc in vps_services:
+                name = svc['name']
+                domain = svc['domain']
+                backend_addr = svc['backend']
+                websocket = svc.get('websocket', False)
+                timeout = svc.get('timeout', {'connect': 60, 'send': 60, 'read': 60})
+
+                nginx_config += f"""# =====================
+# {name.upper()} (VPS-local)
+# =====================
+server {{
+    listen {https_port} ssl;
+    http2 on;
+    listen [::]:{https_port} ssl;
+    server_name {domain};
+
+    ssl_certificate /etc/letsencrypt/live/{first_ssl_domain}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/{first_ssl_domain}/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:SSL:10m;
+    ssl_session_timeout 1d;
+
+    location / {{
+        proxy_pass http://{backend_addr};
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_http_version 1.1;
+"""
+                if websocket:
+                    nginx_config += """        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $connection_upgrade;
+"""
+                else:
+                    nginx_config += '        proxy_set_header Connection "";\n'
+
+                nginx_config += f"""
+        proxy_connect_timeout {timeout.get('connect', 60)}s;
+        proxy_send_timeout {timeout.get('send', 60)}s;
+        proxy_read_timeout {timeout.get('read', 60)}s;
+
+        proxy_buffering off;
+        proxy_request_buffering off;
+    }}
+}}
+
+"""
 
         return nginx_config
 
@@ -1016,7 +1085,7 @@ PROXIED={'true' if cf_config.get('proxied', False) else 'false'}
         if not services:
             return True
 
-        configured_domains = [s['domain'] for s in services]
+        configured_domains = self._get_all_domains()
         current_cert_domains = self.get_cert_domains() if not force_renew else []
 
         # Find domains that need to be added
@@ -1278,12 +1347,26 @@ PROXIED={'true' if cf_config.get('proxied', False) else 'false'}
             print(f"  Failed to start containers: {stderr}")
             return False
 
+        # Clean up old manual conf files that are now managed by deploy
+        print("  Cleaning up old manual config files...")
+        vps_managed_names = [s['name'] for s in self.config.get('vps_services', [])]
+        # Remove individual conf files for VPS services now in nas_proxy.conf
+        cleanup_files = []
+        for name in vps_managed_names:
+            cleanup_files.append(f"{self.VPS_DEPLOY_PATH}/nginx/conf.d/{name}.conf")
+        # Also clean known legacy files
+        for legacy in ['agent-dashboard.conf', 'bwg.conf', 'flight.conf', 'pt.conf', 'pt.conf.bak.*']:
+            cleanup_files.append(f"{self.VPS_DEPLOY_PATH}/nginx/conf.d/{legacy}")
+        if cleanup_files:
+            cleanup_cmd = "rm -f " + " ".join(cleanup_files)
+            self._ssh_cmd(cleanup_cmd)
+
         # Reload nginx to apply latest config (ports, hosts, etc.)
         self._ssh_cmd(f"cd {self.VPS_DEPLOY_PATH} && docker compose exec -T nginx-proxy nginx -s reload")
 
         # Request certificates if needed (new certs or new domains)
         services = self.config.get('services', [])
-        configured_domains = [s['domain'] for s in services]
+        configured_domains = self._get_all_domains()
         current_cert_domains = self.get_cert_domains() if certs_exist else []
         needs_cert_update = not certs_exist or any(d not in current_cert_domains for d in configured_domains)
 
@@ -1489,6 +1572,12 @@ PROXIED={'true' if cf_config.get('proxied', False) else 'false'}
             for service in services:
                 print(f"  - {service['name']}: https://{service['domain']}{https_port_suffix}")
 
+        vps_services = self.config.get('vps_services', [])
+        if vps_services:
+            print("\nVPS-Local Services:")
+            for svc in vps_services:
+                print(f"  - {svc['name']}: https://{svc['domain']}{https_port_suffix} -> {svc['backend']}")
+
         if tcp_services:
             print("\nTCP Services:")
             server_host = self.config['server']['host']
@@ -1528,7 +1617,8 @@ PROXIED={'true' if cf_config.get('proxied', False) else 'false'}
         print("=" * 50)
         print(f"VPS: {self.config['server']['host']}")
         print(f"Backend: {self.config['backend']['host']}")
-        print(f"HTTP Services: {len(services)}, TCP Services: {len(tcp_services)}")
+        vps_services = self.config.get('vps_services', [])
+        print(f"HTTP Services: {len(services)}, VPS-Local: {len(vps_services)}, TCP: {len(tcp_services)}")
         if cf_enabled:
             print("Cloudflare DNS: Enabled")
 

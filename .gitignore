@@ -25,5 +25,3 @@ Thumbs.db
 # Private configs (do not commit)
 config.yaml
 CLAUDE.md
-AGENT.md
-*.md.bak

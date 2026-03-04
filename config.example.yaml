@@ -88,3 +88,20 @@ tcp_services:
 #    listen_port: 3307
 #    backend_port: 3306
 #    protocol: "tcp"
+
+# VPS-local services (running directly on VPS, not proxied through NAS)
+# These generate nginx server blocks that proxy to localhost on VPS
+vps_services:
+  - name: "monitoring"
+    domain: "monitor.example.com"
+    backend: "127.0.0.1:3001"    # VPS localhost address:port
+    websocket: true
+    timeout:
+      connect: 60
+      send: 60
+      read: 60
+
+#  - name: "dashboard"
+#    domain: "dash.example.com"
+#    backend: "127.0.0.1:8080"
+#    websocket: false
